@@ -11,7 +11,7 @@ import httpx
 
 from database import get_db, Base, engine
 from models import Message, Contact, Conversation
-from routes import conversations, commands
+from routes import conversations, commands, bungalows
 
 load_dotenv()
 
@@ -91,6 +91,7 @@ app.add_middleware(
 
 app.include_router(conversations.router, prefix="/api")
 app.include_router(commands.router, prefix="/api")
+app.include_router(bungalows.router, prefix="/api")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
