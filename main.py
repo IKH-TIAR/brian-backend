@@ -1,7 +1,8 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -14,6 +15,23 @@ from models import Message, Contact, Conversation
 from routes import conversations, commands, bungalows
 
 load_dotenv()
+
+security = HTTPBearer()
+
+def verify_admin_password(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    correct_password = os.getenv("ADMIN_PASSWORD")
+    if not correct_password:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ADMIN_PASSWORD is not set on the server"
+        )
+    if credentials.credentials != correct_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
 
 class ConnectionManager:
     def __init__(self):
@@ -89,9 +107,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(conversations.router, prefix="/api")
-app.include_router(commands.router, prefix="/api")
-app.include_router(bungalows.router, prefix="/api")
+app.include_router(conversations.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(commands.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(bungalows.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
