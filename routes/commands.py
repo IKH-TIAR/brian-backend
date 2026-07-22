@@ -36,6 +36,7 @@ class CommandUpdateRequest(BaseModel):
     template_en: str | None = None
     template_es: str | None = None
     is_active: bool
+    set_mode_after: str | None = None
 
 @router.get("/admin/commands")
 async def get_all_commands(db: AsyncSession = Depends(get_db)):
@@ -52,7 +53,8 @@ async def get_all_commands(db: AsyncSession = Depends(get_db)):
             "ai_system_prompt": cmd.ai_system_prompt or "",
             "template_en": cmd.template_en or "",
             "template_es": cmd.template_es or "",
-            "is_active": cmd.is_active
+            "is_active": cmd.is_active,
+            "set_mode_after": cmd.set_mode_after
         }
         for cmd in commands
     ]
@@ -71,6 +73,7 @@ async def update_command(command_id: str, req: CommandUpdateRequest, db: AsyncSe
     cmd.template_en = req.template_en
     cmd.template_es = req.template_es
     cmd.is_active = req.is_active
+    cmd.set_mode_after = req.set_mode_after
     
     await db.commit()
     return {"status": "success"}

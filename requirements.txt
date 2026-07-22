@@ -7,3 +7,4 @@ httpx
 websockets
 pydantic
 pydantic-settings
+pywebpush

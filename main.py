@@ -7,12 +7,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import text
 from dotenv import load_dotenv
 import httpx
+import json
+from pywebpush import webpush, WebPushException
 
-from database import get_db, Base, engine
-from models import Message, Contact, Conversation
-from routes import conversations, commands, bungalows
+from database import get_db, async_session_maker, Base, engine
+from models import Message, Contact, Conversation, PushSubscription
+from routes import conversations, commands, bungalows, push
 
 load_dotenv()
 
@@ -54,6 +57,73 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+async def dispatch_web_push(payload_data: dict):
+    private_key = os.getenv("VAPID_PRIVATE_KEY")
+    subject = os.getenv("VAPID_SUBJECT", "mailto:admin@hermosabeachbungalows.com")
+    if not private_key:
+        return
+
+    is_escalated = bool(payload_data.get("escalated"))
+    phone = payload_data.get("phone", "Guest")
+    content = payload_data.get("content", "")
+    reason = payload_data.get("escalation_reason", "")
+    role = payload_data.get("role", "user")
+
+    # Only send push notifications for user messages or escalations
+    if not is_escalated and role != "user":
+        return
+
+    if is_escalated:
+        title = f"🚨 ESCALATION ALERT: {phone}"
+        body = reason or content or "Conversation escalated to HUMAN mode!"
+    else:
+        title = f"New Message: {phone}"
+        body = content
+
+    push_payload = json.dumps({
+        "title": title,
+        "body": body,
+        "phone": phone,
+        "escalated": is_escalated,
+        "icon": "https://cdn-icons-png.flaticon.com/512/3602/3602145.png"
+    })
+
+    async with async_session_maker() as session:
+        stmt = select(PushSubscription)
+        res = await session.execute(stmt)
+        subscriptions = res.scalars().all()
+
+        stale_ids = []
+        for sub in subscriptions:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub.endpoint,
+                        "keys": {
+                            "p256dh": sub.p256dh,
+                            "auth": sub.auth
+                        }
+                    },
+                    data=push_payload,
+                    vapid_private_key=private_key,
+                    vapid_claims={"sub": subject}
+                )
+            except WebPushException as ex:
+                if ex.response and ex.response.status_code in (404, 410):
+                    stale_ids.append(sub.id)
+                else:
+                    print(f"Web Push send error: {ex}")
+            except Exception as e:
+                print(f"Unexpected Web Push error: {e}")
+
+        if stale_ids:
+            for sid in stale_ids:
+                await session.execute(
+                    text("DELETE FROM push_subscriptions WHERE id = :sid"),
+                    {"sid": sid}
+                )
+            await session.commit()
+
 async def poll_for_messages():
     last_message_id = None
     while True:
@@ -70,20 +140,22 @@ async def poll_for_messages():
                         conv = conv_result.scalar_one_or_none()
                         
                         if conv and conv.contact:
+                            msg_data = {
+                                "id": str(latest_msg.id),
+                                "conversation_id": str(latest_msg.conversation_id),
+                                "phone": conv.contact.phone,
+                                "role": latest_msg.role,
+                                "content": latest_msg.content,
+                                "created_at": latest_msg.created_at.isoformat() if latest_msg.created_at else None,
+                                "escalated": latest_msg.escalated,
+                                "escalation_reason": latest_msg.escalation_reason,
+                                "contact_mode": conv.contact.mode
+                            }
                             await manager.broadcast({
                                 "type": "new_message",
-                                "data": {
-                                    "id": str(latest_msg.id),
-                                    "conversation_id": str(latest_msg.conversation_id),
-                                    "phone": conv.contact.phone,
-                                    "role": latest_msg.role,
-                                    "content": latest_msg.content,
-                                    "created_at": latest_msg.created_at.isoformat() if latest_msg.created_at else None,
-                                    "escalated": latest_msg.escalated,
-                                    "escalation_reason": latest_msg.escalation_reason,
-                                    "contact_mode": conv.contact.mode
-                                }
+                                "data": msg_data
                             })
+                            asyncio.create_task(dispatch_web_push(msg_data))
                     last_message_id = str(latest_msg.id)
                 break
         except Exception as e:
@@ -110,6 +182,7 @@ app.add_middleware(
 app.include_router(conversations.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(commands.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(bungalows.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(push.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
