@@ -65,6 +65,8 @@ async def dispatch_web_push(payload_data: dict):
 
     is_escalated = bool(payload_data.get("escalated"))
     phone = payload_data.get("phone", "Guest")
+    name = payload_data.get("name")
+    display_title = name.strip() if (name and str(name).strip()) else phone
     content = payload_data.get("content", "")
     reason = payload_data.get("escalation_reason", "")
     role = payload_data.get("role", "user")
@@ -74,10 +76,10 @@ async def dispatch_web_push(payload_data: dict):
         return
 
     if is_escalated:
-        title = f"🚨 ESCALATION ALERT: {phone}"
+        title = f"🚨 ESCALATION ALERT: {display_title}"
         body = reason or content or "Conversation escalated to HUMAN mode!"
     else:
-        title = f"New Message: {phone}"
+        title = f"New Message: {display_title}"
         body = content
 
     push_payload = json.dumps({
@@ -140,10 +142,12 @@ async def poll_for_messages():
                         conv = conv_result.scalar_one_or_none()
                         
                         if conv and conv.contact:
+                            contact_name = conv.contact.name.strip() if (conv.contact.name and conv.contact.name.strip()) else None
                             msg_data = {
                                 "id": str(latest_msg.id),
                                 "conversation_id": str(latest_msg.conversation_id),
                                 "phone": conv.contact.phone,
+                                "name": contact_name,
                                 "role": latest_msg.role,
                                 "content": latest_msg.content,
                                 "created_at": latest_msg.created_at.isoformat() if latest_msg.created_at else None,
