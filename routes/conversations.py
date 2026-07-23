@@ -191,6 +191,53 @@ async def get_conversation_thread(
     msgs_raw = list(msgs_raw[:MESSAGES_PER_PAGE])  # trim the extra
     msgs_raw.reverse()  # back to chronological order for the frontend
 
+    # Query 3: Fetch media records for this phone number from whatsapp_media
+    media_result = await db.execute(
+        text("""
+            SELECT id, media_id, mime_type, caption, file_size, created_at
+            FROM whatsapp_media
+            WHERE phone = :phone
+            ORDER BY created_at ASC
+        """),
+        {"phone": phone}
+    )
+    media_rows = list(media_result.mappings().all())
+
+    formatted_messages = []
+    media_idx = 0
+
+    for m in msgs_raw:
+        msg_dict = {
+            "id": str(m["id"]),
+            "role": m["role"],
+            "content": m["content"],
+            "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+            "escalated": m["escalated"],
+            "escalation_reason": m["escalation_reason"],
+            "media_url": None,
+            "mime_type": None,
+            "caption": None
+        }
+
+        content_lower = (m["content"] or "").lower()
+        is_image_msg = ("image" in content_lower or "photo" in content_lower or "media" in content_lower or "picture" in content_lower)
+
+        if is_image_msg and media_idx < len(media_rows):
+            med = media_rows[media_idx]
+            msg_dict["media_url"] = f"/api/media/{med['id']}"
+            msg_dict["mime_type"] = med["mime_type"]
+            if med["caption"]:
+                msg_dict["caption"] = med["caption"]
+            media_idx += 1
+        elif is_image_msg and len(media_rows) > 0:
+            med = media_rows[-1]
+            msg_dict["media_url"] = f"/api/media/{med['id']}"
+            msg_dict["mime_type"] = med["mime_type"]
+            if med["caption"]:
+                msg_dict["caption"] = med["caption"]
+
+        formatted_messages.append(msg_dict)
+
     # Fire is_read update in the background — response is returned immediately
     background_tasks.add_task(_mark_messages_read, conv_id)
 
@@ -208,16 +255,7 @@ async def get_conversation_thread(
             "check_out": result["check_out"],
             "payment_due_date": result["payment_due_date"]
         },
-        "messages": [
-            {
-                "id": str(m["id"]),
-                "role": m["role"],
-                "content": m["content"],
-                "created_at": m["created_at"].isoformat() if m["created_at"] else None,
-                "escalated": m["escalated"],
-                "escalation_reason": m["escalation_reason"]
-            } for m in msgs_raw
-        ],
+        "messages": formatted_messages,
         "has_more": has_more
     }
 
