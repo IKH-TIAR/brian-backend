@@ -15,7 +15,8 @@ from pywebpush import webpush, WebPushException
 
 from database import get_db, async_session_maker, Base, engine
 from models import Message, Contact, Conversation, PushSubscription
-from routes import conversations, commands, bungalows, push, media
+from routes import conversations, commands, bungalows, push, media, pricing
+from seed_pricing import seed_pricing_data
 
 load_dotenv()
 
@@ -169,6 +170,10 @@ async def poll_for_messages():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        await seed_pricing_data()
+    except Exception as e:
+        print(f"Error seeding pricing data: {e}")
     polling_task = asyncio.create_task(poll_for_messages())
     yield
     polling_task.cancel()
@@ -186,6 +191,7 @@ app.add_middleware(
 app.include_router(conversations.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(commands.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(bungalows.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(pricing.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(push.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(media.router, prefix="/api")
 

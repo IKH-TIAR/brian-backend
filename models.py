@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, DateTime, Date, ForeignKey, Text, JSON
+from sqlalchemy import Column, String, Boolean, DateTime, Date, ForeignKey, Text, JSON, Numeric, Integer, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -93,4 +93,156 @@ class PushSubscription(Base):
     auth = Column(Text, nullable=False)
     user_agent = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ==================================================
+# PRICING MANAGEMENT MODELS
+# ==================================================
+
+class Property(Base):
+    __tablename__ = "properties"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(String(50), unique=True, nullable=False)
+    name = Column(String(150), nullable=False)
+    standard_capacity = Column(Integer, nullable=False, default=1)
+    maximum_capacity = Column(Integer, nullable=False, default=1)
+    pets_allowed = Column(Boolean, default=True)
+    active = Column(Boolean, default=True)
+    display_order = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    rate_plans = relationship("PropertyRatePlan", back_populates="property", cascade="all, delete-orphan")
+
+
+class PropertyRatePlan(Base):
+    __tablename__ = "property_rate_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=False)
+    code = Column(String(50), nullable=False)
+    name = Column(String(150), nullable=False)
+    standard_capacity = Column(Integer, nullable=False, default=1)
+    maximum_capacity = Column(Integer, nullable=False, default=1)
+    cleaning_fee = Column(Numeric(10, 2), nullable=False, default=0.00)
+    extra_person_fee_per_night = Column(Numeric(10, 2), nullable=False, default=10.00)
+    refundable_deposit = Column(Numeric(10, 2), nullable=False, default=0.00)
+    pets_allowed = Column(Boolean, default=True)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    property = relationship("Property", back_populates="rate_plans")
+    seasonal_prices = relationship("PropertySeasonPrice", back_populates="rate_plan", cascade="all, delete-orphan")
+    promotional_prices = relationship("PromotionPropertyPrice", back_populates="rate_plan", cascade="all, delete-orphan")
+
+
+class PricingTier(Base):
+    __tablename__ = "pricing_tiers"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(String(50), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    seasonal_prices = relationship("PropertySeasonPrice", back_populates="pricing_tier")
+
+
+class Season(Base):
+    __tablename__ = "seasons"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(String(50), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    priority = Column(Integer, nullable=False, default=100)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    periods = relationship("SeasonPeriod", back_populates="season", cascade="all, delete-orphan")
+    seasonal_prices = relationship("PropertySeasonPrice", back_populates="season", cascade="all, delete-orphan")
+
+
+class SeasonPeriod(Base):
+    __tablename__ = "season_periods"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    season_id = Column(UUID(as_uuid=True), ForeignKey("seasons.id"), nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    active = Column(Boolean, default=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    season = relationship("Season", back_populates="periods")
+
+
+class PropertySeasonPrice(Base):
+    __tablename__ = "property_season_prices"
+    __table_args__ = (
+        UniqueConstraint("property_rate_plan_id", "season_id", "pricing_tier_id", name="uq_rateplan_season_tier"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    property_rate_plan_id = Column(UUID(as_uuid=True), ForeignKey("property_rate_plans.id"), nullable=False)
+    season_id = Column(UUID(as_uuid=True), ForeignKey("seasons.id"), nullable=False)
+    pricing_tier_id = Column(UUID(as_uuid=True), ForeignKey("pricing_tiers.id"), nullable=False)
+    nightly_rate = Column(Numeric(10, 2), nullable=False, default=0.00)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    rate_plan = relationship("PropertyRatePlan", back_populates="seasonal_prices")
+    season = relationship("Season", back_populates="seasonal_prices")
+    pricing_tier = relationship("PricingTier", back_populates="seasonal_prices")
+
+
+class Promotion(Base):
+    __tablename__ = "promotions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(150), nullable=False)
+    description = Column(Text, nullable=True)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    enabled = Column(Boolean, default=True)
+    waive_pet_fee = Column(Boolean, default=False)
+    priority = Column(Integer, default=1000)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    property_prices = relationship("PromotionPropertyPrice", back_populates="promotion", cascade="all, delete-orphan")
+
+
+class PromotionPropertyPrice(Base):
+    __tablename__ = "promotion_property_prices"
+    __table_args__ = (
+        UniqueConstraint("promotion_id", "property_rate_plan_id", name="uq_promotion_rateplan"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    promotion_id = Column(UUID(as_uuid=True), ForeignKey("promotions.id"), nullable=False)
+    property_rate_plan_id = Column(UUID(as_uuid=True), ForeignKey("property_rate_plans.id"), nullable=False)
+    nightly_rate = Column(Numeric(10, 2), nullable=False, default=0.00)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    promotion = relationship("Promotion", back_populates="property_prices")
+    rate_plan = relationship("PropertyRatePlan", back_populates="promotional_prices")
+
+
+class PricingSetting(Base):
+    __tablename__ = "pricing_settings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key = Column(String(50), unique=True, nullable=False)
+    value = Column(String(255), nullable=False)
+    description = Column(String(255), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
