@@ -13,12 +13,18 @@ router = APIRouter()
 
 @router.get("/commands")
 async def list_commands(db: AsyncSession = Depends(get_db)):
-    stmt = select(AdminCommand).filter(AdminCommand.is_active == True)
+    # Explicit columns only — skips the 3 large unused Text columns
+    # (ai_system_prompt, template_en, template_es)
+    stmt = (
+        select(AdminCommand.command, AdminCommand.label, AdminCommand.category,
+               AdminCommand.required_params, AdminCommand.is_ai)
+        .filter(AdminCommand.is_active == True)
+    )
     result = await db.execute(stmt)
-    commands = result.scalars().all()
-    
+    rows = result.all()
+
     output = {}
-    for cmd in commands:
+    for cmd in rows:
         if cmd.category not in output:
             output[cmd.category] = []
         output[cmd.category].append({
@@ -27,7 +33,7 @@ async def list_commands(db: AsyncSession = Depends(get_db)):
             "required_params": cmd.required_params,
             "is_ai": cmd.is_ai
         })
-        
+
     return output
 
 class CommandUpdateRequest(BaseModel):

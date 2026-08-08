@@ -4,7 +4,8 @@ from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -223,6 +224,9 @@ async def get_seasons(db: AsyncSession = Depends(get_db)):
     all_periods_res = await db.execute(select(SeasonPeriod).filter(SeasonPeriod.active == True))
     all_active_periods = all_periods_res.scalars().all()
 
+    # Lookup map so the overlap check never hits the DB (was an N+1 in a nested loop)
+    season_by_id = {s.id: s for s in seasons}
+
     out = []
     for s in seasons:
         periods_out = []
@@ -235,8 +239,7 @@ async def get_seasons(db: AsyncSession = Depends(get_db)):
                     # Date overlap condition: max(start1, start2) <= min(end1, end2)
                     if max(p.start_date, other.start_date) <= min(p.end_date, other.end_date):
                         has_overlap = True
-                        other_season_res = await db.execute(select(Season).filter(Season.id == other.season_id))
-                        other_season = other_season_res.scalar_one_or_none()
+                        other_season = season_by_id.get(other.season_id)
                         s_name = other_season.name if other_season else "Another Season"
                         overlap_details.append(f"Overlaps with {s_name} ({other.start_date} to {other.end_date})")
 
@@ -393,28 +396,30 @@ async def get_pricing_matrix(db: AsyncSession = Depends(get_db)):
 
 @router.put("/admin/pricing/matrix")
 async def update_pricing_matrix(items: List[SeasonalPriceUpdateItem], db: AsyncSession = Depends(get_db)):
-    for item in items:
-        res = await db.execute(
-            select(PropertySeasonPrice).filter(
-                PropertySeasonPrice.property_rate_plan_id == item.property_rate_plan_id,
-                PropertySeasonPrice.season_id == item.season_id,
-                PropertySeasonPrice.pricing_tier_id == item.pricing_tier_id,
-            )
-        )
-        obj = res.scalar_one_or_none()
-        if obj:
-            obj.nightly_rate = item.nightly_rate
-            obj.active = item.active
-        else:
-            obj = PropertySeasonPrice(
-                id=uuid.uuid4(),
-                property_rate_plan_id=item.property_rate_plan_id,
-                season_id=item.season_id,
-                pricing_tier_id=item.pricing_tier_id,
-                nightly_rate=item.nightly_rate,
-                active=item.active
-            )
-            db.add(obj)
+    # Single bulk upsert instead of one SELECT + UPDATE/INSERT per cell
+    stmt = pg_insert(PropertySeasonPrice).values([
+        {
+            "property_rate_plan_id": item.property_rate_plan_id,
+            "season_id": item.season_id,
+            "pricing_tier_id": item.pricing_tier_id,
+            "nightly_rate": item.nightly_rate,
+            "active": item.active,
+        }
+        for item in items
+    ])
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[
+            PropertySeasonPrice.property_rate_plan_id,
+            PropertySeasonPrice.season_id,
+            PropertySeasonPrice.pricing_tier_id,
+        ],
+        set_={
+            "nightly_rate": stmt.excluded.nightly_rate,
+            "active": stmt.excluded.active,
+            "updated_at": func.now(),
+        },
+    )
+    await db.execute(stmt)
     await db.commit()
     return {"status": "success", "count": len(items)}
 
@@ -428,37 +433,33 @@ async def bulk_adjust_prices(req: BulkPriceAdjustRequest, db: AsyncSession = Dep
     if not tier_ids:
         raise HTTPException(status_code=400, detail="No matching pricing tiers specified")
 
-    query = select(PropertySeasonPrice).filter(
+    # SQL arithmetic per adjustment type (single UPDATE, no row-by-row Python writes)
+    if req.adjustment_type == "percent_increase":
+        rate_expr = PropertySeasonPrice.nightly_rate * (Decimal("1") + req.amount / Decimal("100"))
+    elif req.adjustment_type == "percent_decrease":
+        rate_expr = PropertySeasonPrice.nightly_rate * (Decimal("1") - req.amount / Decimal("100"))
+    elif req.adjustment_type == "fixed_increase":
+        rate_expr = PropertySeasonPrice.nightly_rate + req.amount
+    elif req.adjustment_type == "fixed_decrease":
+        rate_expr = PropertySeasonPrice.nightly_rate - req.amount
+    else:
+        raise HTTPException(status_code=400, detail="Invalid adjustment type")
+
+    stmt = update(PropertySeasonPrice).where(
         PropertySeasonPrice.season_id.in_(req.season_ids),
-        PropertySeasonPrice.pricing_tier_id.in_(tier_ids)
+        PropertySeasonPrice.pricing_tier_id.in_(tier_ids),
+    )
+    if req.rate_plan_ids:
+        stmt = stmt.where(PropertySeasonPrice.property_rate_plan_id.in_(req.rate_plan_ids))
+
+    stmt = stmt.values(
+        nightly_rate=func.greatest(func.round(rate_expr, 2), 0),
+        updated_at=func.now(),
     )
 
-    if req.rate_plan_ids:
-        query = query.filter(PropertySeasonPrice.property_rate_plan_id.in_(req.rate_plan_ids))
-
-    res = await db.execute(query)
-    prices = res.scalars().all()
-
-    updated_count = 0
-    for p in prices:
-        current = Decimal(str(p.nightly_rate))
-        if req.adjustment_type == "percent_increase":
-            new_rate = current * (Decimal("1.0") + (req.amount / Decimal("100.0")))
-        elif req.adjustment_type == "percent_decrease":
-            new_rate = current * (Decimal("1.0") - (req.amount / Decimal("100.0")))
-        elif req.adjustment_type == "fixed_increase":
-            new_rate = current + req.amount
-        elif req.adjustment_type == "fixed_decrease":
-            new_rate = current - req.amount
-        else:
-            raise HTTPException(status_code=400, detail="Invalid adjustment type")
-
-        new_rate = max(Decimal("0.00"), new_rate.quantize(Decimal("0.01")))
-        p.nightly_rate = new_rate
-        updated_count += 1
-
+    result = await db.execute(stmt)
     await db.commit()
-    return {"status": "success", "updated_count": updated_count}
+    return {"status": "success", "updated_count": result.rowcount}
 
 # ==================================================
 # 5. PROMOTIONS
@@ -472,12 +473,28 @@ async def get_promotions(db: AsyncSession = Depends(get_db)):
             selectinload(Promotion.property_prices)
             .selectinload(PromotionPropertyPrice.rate_plan)
             .selectinload(PropertyRatePlan.property)
-            .selectinload(Property.rate_plans)
         )
         .order_by(Promotion.priority.desc(), Promotion.created_at.desc())
     )
     res = await db.execute(stmt)
     promos = res.scalars().all()
+
+    # One aggregate query for rate-plan sibling counts instead of eager-loading
+    # every property's full rate-plan graph
+    prop_ids = {
+        pp.rate_plan.property_id
+        for pr in promos
+        for pp in pr.property_prices
+        if pp.rate_plan and pp.rate_plan.property
+    }
+    sibling_counts = {}
+    if prop_ids:
+        count_res = await db.execute(
+            select(PropertyRatePlan.property_id, func.count(PropertyRatePlan.id))
+            .where(PropertyRatePlan.property_id.in_(prop_ids))
+            .group_by(PropertyRatePlan.property_id)
+        )
+        sibling_counts = dict(count_res.all())
 
     out = []
     for pr in promos:
@@ -488,7 +505,7 @@ async def get_promotions(db: AsyncSession = Depends(get_db)):
             # Build a display name: "Bungalow 5" or "Bungalow 3 — 2BR"
             if prop and rp:
                 # Check if property has multiple rate plans by counting siblings
-                sibling_count = len(prop.rate_plans) if prop.rate_plans else 1
+                sibling_count = sibling_counts.get(prop.id, 1)
                 if sibling_count > 1:
                     display_name = f"{prop.name} — {rp.name}"
                 else:

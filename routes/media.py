@@ -1,5 +1,6 @@
 import os
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+import hashlib
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -27,6 +28,7 @@ def verify_media_access(
 async def get_media_file(
     identifier: str,
     download: Optional[bool] = Query(False),
+    request: Request = None,
     auth: bool = Depends(verify_media_access),
     db: AsyncSession = Depends(get_db)
 ):
@@ -43,6 +45,17 @@ async def get_media_file(
     if not row or not row["file_data"]:
         raise HTTPException(status_code=404, detail="Media file not found")
 
+    etag = '"' + hashlib.md5(f"{row['media_id'] or identifier}|{row['mime_type']}|{len(row['file_data'])}".encode()).hexdigest() + '"'
+
+    headers = {
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+    }
+
+    if request and request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers=headers)
+
     file_bytes = bytes(row["file_data"])
     mime_type = row["mime_type"] or "image/jpeg"
     ext = "jpg"
@@ -53,7 +66,6 @@ async def get_media_file(
     elif "pdf" in mime_type:
         ext = "pdf"
 
-    headers = {}
     if download:
         filename = f"media_{identifier}.{ext}"
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'

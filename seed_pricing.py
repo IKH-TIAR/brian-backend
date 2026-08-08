@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 from datetime import date
 from sqlalchemy.future import select
@@ -9,6 +10,12 @@ from models import (
 )
 
 async def seed_pricing_data():
+    # Guard: ~250 sequential queries on every boot only run when explicitly enabled.
+    # Run once manually with: python seed_pricing.py
+    if os.getenv("RUN_SEED_ON_STARTUP", "").lower() not in ("1", "true", "yes"):
+        print("Skipping pricing seed (set RUN_SEED_ON_STARTUP=1 to enable).")
+        return
+
     # Ensure tables exist
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

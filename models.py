@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, DateTime, Date, ForeignKey, Text, JSON, Numeric, Integer, UniqueConstraint
+from sqlalchemy import Column, String, Boolean, DateTime, Date, ForeignKey, Text, JSON, Numeric, Integer, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -22,6 +22,9 @@ class Contact(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index("ix_conversations_last_msg", text("last_message_at DESC NULLS LAST")),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     contact_id = Column(UUID(as_uuid=True), ForeignKey("contacts.id"), unique=True)
@@ -38,6 +41,11 @@ class Conversation(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        Index("ix_messages_conv_created", "conversation_id", text("created_at DESC")),
+        Index("ix_messages_created_at", text("created_at DESC")),
+        Index("ix_messages_unread", "conversation_id", postgresql_where=text("role = 'user' AND is_read = FALSE")),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"))
@@ -55,6 +63,9 @@ class Message(Base):
 
 class AdminCommand(Base):
     __tablename__ = "admin_commands"
+    __table_args__ = (
+        Index("ix_admin_commands_cat_label", "category", "label"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     command = Column(String(50), unique=True, nullable=False)
@@ -118,6 +129,9 @@ class Property(Base):
 
 class PropertyRatePlan(Base):
     __tablename__ = "property_rate_plans"
+    __table_args__ = (
+        Index("ix_rate_plans_property", "property_id"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=False)
@@ -168,6 +182,9 @@ class Season(Base):
 
 class SeasonPeriod(Base):
     __tablename__ = "season_periods"
+    __table_args__ = (
+        Index("ix_season_periods_season", "season_id", "start_date", "end_date"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     season_id = Column(UUID(as_uuid=True), ForeignKey("seasons.id"), nullable=False)
@@ -185,6 +202,7 @@ class PropertySeasonPrice(Base):
     __tablename__ = "property_season_prices"
     __table_args__ = (
         UniqueConstraint("property_rate_plan_id", "season_id", "pricing_tier_id", name="uq_rateplan_season_tier"),
+        Index("ix_psp_season_tier", "season_id", "pricing_tier_id"),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

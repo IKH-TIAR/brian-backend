@@ -11,15 +11,20 @@ from models import Conversation, Contact, Message
 
 router = APIRouter()
 
+CONVERSATIONS_PER_PAGE = 50
+
 @router.get("/conversations")
 async def list_conversations(
     search: str = Query(None, min_length=1),
+    limit: int = Query(CONVERSATIONS_PER_PAGE, ge=1, le=200),
+    before: str = Query(None, description="Keyset cursor: '<last_message_at ISO>|<conversation_id>' of the last row"),
     db: AsyncSession = Depends(get_db)
 ):
     from sqlalchemy import text
 
     search_filter = ""
-    params: dict = {}
+    cursor_filter = ""
+    params: dict = {"lim": limit + 1}
 
     if search:
         search_filter = """
@@ -35,6 +40,20 @@ async def list_conversations(
         """
         params["search"] = f"%{search}%"
 
+    if before and "|" in before:
+        before_ts, before_id = before.split("|", 1)
+        cursor_filter = """
+            AND (
+                COALESCE(c.last_message_at, c.created_at) < :before_ts
+                OR (
+                    COALESCE(c.last_message_at, c.created_at) = :before_ts
+                    AND c.id < :before_id
+                )
+            )
+        """
+        params["before_ts"] = before_ts
+        params["before_id"] = before_id
+
     sql = text(f"""
         SELECT
             c.id                                                        AS conversation_id,
@@ -48,45 +67,53 @@ async def list_conversations(
             c.check_out,
             c.last_message_at,
 
-            -- Latest message content + role in one pass
-            (
-                SELECT m2.content FROM messages m2
-                WHERE m2.conversation_id = c.id
-                ORDER BY m2.created_at DESC LIMIT 1
-            ) AS latest_message,
-            (
-                SELECT m2.role FROM messages m2
-                WHERE m2.conversation_id = c.id
-                ORDER BY m2.created_at DESC LIMIT 1
-            ) AS latest_message_role,
+            -- Latest message content + role (index-only scan via ix_messages_conv_created)
+            lm.content AS latest_message,
+            lm.role AS latest_message_role,
 
-            -- Unread count (user messages not yet marked is_read)
-            COUNT(m.id) FILTER (
-                WHERE m.role = 'user' AND m.is_read = FALSE
+            -- Unread count (uses ix_messages_unread partial index)
+            (
+                SELECT COUNT(*) FROM messages m
+                WHERE m.conversation_id = c.id
+                  AND m.role = 'user' AND m.is_read = FALSE
             ) AS unread_count,
 
-            -- Escalation: only relevant when mode = HUMAN
-            BOOL_OR(m.escalated) FILTER (
-                WHERE ct.mode = 'HUMAN'
-            ) AS is_escalated,
-            (
-                SELECT m3.escalation_reason FROM messages m3
-                WHERE m3.conversation_id = c.id
-                  AND m3.escalated = TRUE
-                ORDER BY m3.created_at DESC LIMIT 1
-            ) AS escalation_reason
+            -- Escalation: relevant only when mode = HUMAN
+            CASE
+                WHEN ct.mode = 'HUMAN' AND esc.escalation_reason IS NOT NULL THEN TRUE
+                ELSE FALSE
+            END AS is_escalated,
+            esc.escalation_reason
 
         FROM conversations c
         JOIN contacts ct ON ct.id = c.contact_id
-        LEFT JOIN messages m ON m.conversation_id = c.id
+        LEFT JOIN LATERAL (
+            SELECT content, role
+            FROM messages m2
+            WHERE m2.conversation_id = c.id
+            ORDER BY m2.created_at DESC
+            LIMIT 1
+        ) lm ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT escalation_reason
+            FROM messages m3
+            WHERE m3.conversation_id = c.id
+              AND m3.escalated = TRUE
+            ORDER BY m3.created_at DESC
+            LIMIT 1
+        ) esc ON TRUE
         WHERE 1=1
         {search_filter}
-        GROUP BY c.id, ct.id
-        ORDER BY c.last_message_at DESC NULLS LAST
+        {cursor_filter}
+        ORDER BY COALESCE(c.last_message_at, c.created_at) DESC NULLS LAST, c.id DESC
+        LIMIT :lim
     """)
 
     result = await db.execute(sql, params)
     rows = result.mappings().all()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
 
     output = []
     for row in rows:
@@ -108,7 +135,7 @@ async def list_conversations(
             "escalation_reason": row["escalation_reason"],
         })
 
-    return output
+    return {"conversations": output, "has_more": has_more}
 
 
 async def _mark_messages_read(conversation_id: str):
@@ -189,17 +216,26 @@ async def get_conversation_thread(
     # If we got one extra, there are older messages available
     has_more = len(msgs_raw) > MESSAGES_PER_PAGE
     msgs_raw = list(msgs_raw[:MESSAGES_PER_PAGE])  # trim the extra
+    newest_msg_ts = msgs_raw[0]["created_at"] if msgs_raw else None
     msgs_raw.reverse()  # back to chronological order for the frontend
 
-    # Query 3: Fetch media records for this phone number from whatsapp_media
+    # Query 3: Fetch media records for this phone number from whatsapp_media,
+    # bounded to the loaded message window (uses ix_wa_media_phone index)
+    media_params = {"phone": phone, "lim": 500}
+    media_window = ""
+    if newest_msg_ts:
+        media_window = "AND created_at <= :newest_ts"
+        media_params["newest_ts"] = newest_msg_ts
     media_result = await db.execute(
-        text("""
+        text(f"""
             SELECT id, media_id, mime_type, caption, file_size, created_at
             FROM whatsapp_media
             WHERE phone = :phone
+            {media_window}
             ORDER BY created_at ASC
+            LIMIT :lim
         """),
-        {"phone": phone}
+        media_params
     )
     media_rows = list(media_result.mappings().all())
 

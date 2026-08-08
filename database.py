@@ -10,7 +10,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in the .env file. Please ensure you copied .env.example to .env and filled in your Supabase connection string.")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_timeout=30,
+)
 
 async_session_maker = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
