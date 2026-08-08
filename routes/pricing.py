@@ -468,7 +468,12 @@ async def bulk_adjust_prices(req: BulkPriceAdjustRequest, db: AsyncSession = Dep
 async def get_promotions(db: AsyncSession = Depends(get_db)):
     stmt = (
         select(Promotion)
-        .options(selectinload(Promotion.property_prices).selectinload(PromotionPropertyPrice.rate_plan))
+        .options(
+            selectinload(Promotion.property_prices)
+            .selectinload(PromotionPropertyPrice.rate_plan)
+            .selectinload(PropertyRatePlan.property)
+            .selectinload(Property.rate_plans)
+        )
         .order_by(Promotion.priority.desc(), Promotion.created_at.desc())
     )
     res = await db.execute(stmt)
@@ -476,17 +481,31 @@ async def get_promotions(db: AsyncSession = Depends(get_db)):
 
     out = []
     for pr in promos:
-        pp_list = [
-            {
+        pp_list = []
+        for pp in pr.property_prices:
+            rp = pp.rate_plan
+            prop = rp.property if rp else None
+            # Build a display name: "Bungalow 5" or "Bungalow 3 — 2BR"
+            if prop and rp:
+                # Check if property has multiple rate plans by counting siblings
+                sibling_count = len(prop.rate_plans) if prop.rate_plans else 1
+                if sibling_count > 1:
+                    display_name = f"{prop.name} — {rp.name}"
+                else:
+                    display_name = prop.name
+            else:
+                display_name = rp.name if rp else ""
+
+            pp_list.append({
                 "id": str(pp.id),
                 "property_rate_plan_id": str(pp.property_rate_plan_id),
-                "rate_plan_code": pp.rate_plan.code if pp.rate_plan else "",
-                "rate_plan_name": pp.rate_plan.name if pp.rate_plan else "",
+                "rate_plan_code": rp.code if rp else "",
+                "rate_plan_name": rp.name if rp else "",
+                "property_name": prop.name if prop else "",
+                "display_name": display_name,
                 "nightly_rate": float(pp.nightly_rate),
                 "active": pp.active
-            }
-            for pp in pr.property_prices
-        ]
+            })
         out.append({
             "id": str(pr.id),
             "name": pr.name,
