@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, DateTime, Date, ForeignKey, Text, JSON, Numeric, Integer, UniqueConstraint, Index, text
+from sqlalchemy import Column, String, Boolean, DateTime, Date, Time, ForeignKey, Text, JSON, Numeric, Integer, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -18,6 +18,7 @@ class Contact(Base):
     created_at = Column(DateTime(timezone=False), server_default=func.now())
 
     conversations = relationship("Conversation", back_populates="contact")
+    bookings = relationship("Booking", back_populates="contact")
 
 
 class Conversation(Base):
@@ -37,6 +38,7 @@ class Conversation(Base):
 
     contact = relationship("Contact", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")
+    bookings = relationship("Booking", back_populates="conversation")
 
 
 class Message(Base):
@@ -94,6 +96,8 @@ class BungalowCode(Base):
     wifi_password = Column(String, nullable=True)
     special_notes = Column(Text, nullable=True)
 
+    template_configs = relationship("PropertyTemplateConfig", back_populates="bungalow_code")
+
 
 class PushSubscription(Base):
     __tablename__ = "push_subscriptions"
@@ -125,6 +129,8 @@ class Property(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     rate_plans = relationship("PropertyRatePlan", back_populates="property", cascade="all, delete-orphan")
+    template_configs = relationship("PropertyTemplateConfig", back_populates="property", cascade="all, delete-orphan")
+    booking_units = relationship("BookingUnit", back_populates="property")
 
 
 class PropertyRatePlan(Base):
@@ -143,6 +149,7 @@ class PropertyRatePlan(Base):
     extra_person_fee_per_night = Column(Numeric(10, 2), nullable=False, default=10.00)
     refundable_deposit = Column(Numeric(10, 2), nullable=False, default=0.00)
     pets_allowed = Column(Boolean, default=True)
+    minimum_nights = Column(Integer, nullable=True, default=1)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -259,8 +266,113 @@ class PricingSetting(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     key = Column(String(50), unique=True, nullable=False)
-    value = Column(String(255), nullable=False)
+    value = Column(Text, nullable=False)
     description = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ==================================================
+# NEW ENTITY MODELS (Bookings, Templates, Logs)
+# ==================================================
+
+class Booking(Base):
+    __tablename__ = "bookings"
+    __table_args__ = (
+        Index("ix_bookings_status_checkin", "status", text("check_in DESC")),
+        Index("ix_bookings_contact", "contact_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    reservation_reference = Column(String(100), nullable=True)
+    contact_id = Column(UUID(as_uuid=True), ForeignKey("contacts.id"), nullable=False)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True)
+    source = Column(String(50), nullable=True)
+    status = Column(String(30), nullable=False, default="pending")
+    check_in = Column(Date, nullable=True)
+    check_out = Column(Date, nullable=True)
+    checkout_time = Column(Time, nullable=True, default=text("'11:00:00'"))
+    guest_count = Column(Integer, nullable=True, default=1)
+    has_pets = Column(Boolean, default=False)
+    guest_name = Column(String(150), nullable=True)
+    guest_first_name = Column(String(100), nullable=True)
+    language_tag = Column(String(20), nullable=True, default="english")
+    currency = Column(String(10), nullable=True, default="USD")
+    total_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
+    deposit_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
+    balance_due = Column(Numeric(10, 2), nullable=True, default=0.00)
+    deposit_due_date = Column(Date, nullable=True)
+    payment_due_date = Column(Date, nullable=True)
+    pricing_snapshot = Column(JSONB, nullable=True)
+    internal_notes = Column(Text, nullable=True)
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    checked_in_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    contact = relationship("Contact", back_populates="bookings")
+    conversation = relationship("Conversation", back_populates="bookings")
+    booking_units = relationship("BookingUnit", back_populates="booking", cascade="all, delete-orphan")
+
+
+class BookingUnit(Base):
+    __tablename__ = "booking_units"
+    __table_args__ = (
+        Index("ix_booking_units_booking", "booking_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    booking_id = Column(UUID(as_uuid=True), ForeignKey("bookings.id"), nullable=False)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=True)
+    unit_name_snapshot = Column(String(150), nullable=True)
+    accommodation_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
+    cleaning_fee = Column(Numeric(10, 2), nullable=True, default=0.00)
+    pet_fee = Column(Numeric(10, 2), nullable=True, default=0.00)
+    discount_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
+    unit_total = Column(Numeric(10, 2), nullable=True, default=0.00)
+    pricing_snapshot = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    booking = relationship("Booking", back_populates="booking_units")
+    property = relationship("Property", back_populates="booking_units")
+
+
+class PropertyTemplateConfig(Base):
+    __tablename__ = "property_template_config"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    property_id = Column(UUID(as_uuid=True), ForeignKey("properties.id"), nullable=False)
+    bungalow_code_id = Column(UUID(as_uuid=True), ForeignKey("bungalow_codes.id"), nullable=True)
+    map_link = Column(Text, nullable=True)
+    default_checkout_time = Column(Time, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    property = relationship("Property", back_populates="template_configs")
+    bungalow_code = relationship("BungalowCode", back_populates="template_configs")
+
+
+class WhatsappTemplateSend(Base):
+    __tablename__ = "whatsapp_template_sends"
+    __table_args__ = (
+        Index("ix_template_sends_phone", "phone", text("sent_at DESC")),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    booking_id = Column(UUID(as_uuid=True), ForeignKey("bookings.id"), nullable=True)
+    booking_unit_id = Column(UUID(as_uuid=True), ForeignKey("booking_units.id"), nullable=True)
+    phone = Column(String(30), nullable=False)
+    template_key = Column(String(100), nullable=False)
+    template_name = Column(String(150), nullable=False)
+    language_tag = Column(String(20), nullable=False, default="english")
+    dedupe_key = Column(Text, nullable=False)
+    meta_message_id = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default="sent")
+    payload = Column(JSONB, nullable=False, default=dict)
+    sent_at = Column(DateTime(timezone=True), server_default=func.now())
+
 
 

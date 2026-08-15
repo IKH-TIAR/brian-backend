@@ -29,6 +29,7 @@ class PropertyRatePlanUpdate(BaseModel):
     extra_person_fee_per_night: Optional[Decimal] = Field(None, ge=0)
     refundable_deposit: Optional[Decimal] = Field(None, ge=0)
     pets_allowed: Optional[bool] = None
+    minimum_nights: Optional[int] = Field(None, ge=1)
     active: Optional[bool] = None
 
 class PropertyUpdate(BaseModel):
@@ -126,6 +127,7 @@ async def get_properties(db: AsyncSession = Depends(get_db)):
                 "extra_person_fee_per_night": float(rp.extra_person_fee_per_night),
                 "refundable_deposit": float(rp.refundable_deposit),
                 "pets_allowed": rp.pets_allowed,
+                "minimum_nights": rp.minimum_nights if rp.minimum_nights is not None else 1,
                 "active": rp.active,
             }
             for rp in sorted(p.rate_plans, key=lambda x: x.code)
@@ -191,6 +193,8 @@ async def update_rate_plan(plan_id: str, req: PropertyRatePlanUpdate, db: AsyncS
         plan.refundable_deposit = req.refundable_deposit
     if req.pets_allowed is not None:
         plan.pets_allowed = req.pets_allowed
+    if req.minimum_nights is not None:
+        plan.minimum_nights = req.minimum_nights
     if req.active is not None:
         plan.active = req.active
 
@@ -619,17 +623,66 @@ async def delete_promotion(promotion_id: str, db: AsyncSession = Depends(get_db)
 # 6. GENERAL PRICING SETTINGS
 # ==================================================
 
+import json
+
+class SingleSettingUpdate(BaseModel):
+    value: str
+    description: Optional[str] = None
+
 @router.get("/admin/pricing/settings")
 async def get_pricing_settings(db: AsyncSession = Depends(get_db)):
-    res = await db.execute(select(PricingSetting))
+    res = await db.execute(select(PricingSetting).order_by(PricingSetting.key))
     settings = res.scalars().all()
-    out = {s.key: s.value for s in settings}
+    
+    settings_list = [
+        {
+            "id": str(s.id),
+            "key": s.key,
+            "value": s.value,
+            "description": s.description or ""
+        }
+        for s in settings
+    ]
+    
+    out_map = {s.key: s.value for s in settings}
     return {
-        "currency": out.get("currency", "USD"),
-        "default_pet_fee": float(out.get("default_pet_fee", "30.00")),
-        "default_extra_person_fee": float(out.get("default_extra_person_fee", "10.00")),
-        "multi_property_refundable_deposit": float(out.get("multi_property_refundable_deposit", "100.00")),
+        "settings": settings_list,
+        "currency": out_map.get("currency", "USD"),
+        "default_pet_fee": float(out_map.get("default_pet_fee", "30.00")) if "default_pet_fee" in out_map else 30.00,
+        "default_extra_person_fee": float(out_map.get("default_extra_person_fee", "10.00")) if "default_extra_person_fee" in out_map else 10.00,
+        "multi_property_refundable_deposit": float(out_map.get("multi_property_refundable_deposit", "100.00")) if "multi_property_refundable_deposit" in out_map else 100.00,
     }
+
+@router.put("/admin/pricing/settings/{key}")
+async def update_single_pricing_setting(key: str, req: SingleSettingUpdate, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(PricingSetting).filter(PricingSetting.key == key))
+    setting = res.scalar_one_or_none()
+
+    if setting and setting.value:
+        # Validate JSON if existing value parses as JSON
+        try:
+            json.loads(setting.value)
+            # Existing value is valid JSON, so check new value
+            try:
+                json.loads(req.value)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON payload for setting key '{key}'")
+        except HTTPException:
+            raise
+        except Exception:
+            # Existing value was not JSON, normal text assignment
+            pass
+
+    if setting:
+        setting.value = req.value
+        if req.description is not None:
+            setting.description = req.description
+    else:
+        setting = PricingSetting(id=uuid.uuid4(), key=key, value=req.value, description=req.description)
+        db.add(setting)
+
+    await db.commit()
+    return {"status": "success"}
 
 @router.put("/admin/pricing/settings")
 async def update_pricing_settings(req: PricingSettingsUpdate, db: AsyncSession = Depends(get_db)):

@@ -16,7 +16,7 @@ from pywebpush import webpush, WebPushException
 
 from database import get_db, async_session_maker, Base, engine
 from models import Message, Contact, Conversation, PushSubscription
-from routes import conversations, commands, bungalows, push, media, pricing
+from routes import conversations, commands, bungalows, push, media, pricing, bookings, template_config, template_sends
 from migrations import ensure_indexes
 from seed_pricing import seed_pricing_data
 
@@ -209,6 +209,9 @@ app.include_router(conversations.router, prefix="/api", dependencies=[Depends(ve
 app.include_router(commands.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(bungalows.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(pricing.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(bookings.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(template_config.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
+app.include_router(template_sends.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(push.router, prefix="/api", dependencies=[Depends(verify_admin_password)])
 app.include_router(media.router, prefix="/api")
 
