@@ -72,6 +72,13 @@ class BookingUpdate(BaseModel):
 class StatusTransitionRequest(BaseModel):
     status: str
 
+
+class ConfirmDepositRequest(BaseModel):
+    phone: Optional[str] = None
+    booking_id: Optional[str] = None
+    deposit_amount: Decimal = Field(..., ge=0)
+    payment_due_date: Optional[date] = None
+
 # Helper to format booking dictionary
 def _format_booking(b: Booking) -> dict:
     units_out = []
@@ -381,3 +388,61 @@ async def update_booking_status(booking_id: str, req: StatusTransitionRequest, d
 
     await db.commit()
     return {"status": "success", "new_status": b.status}
+
+
+
+@router.post("/admin/bookings/confirm-deposit")
+async def confirm_deposit(req: ConfirmDepositRequest, db: AsyncSession = Depends(get_db)):
+    if not req.booking_id and not req.phone:
+        raise HTTPException(status_code=400, detail="Provide either booking_id or phone")
+
+    stmt = (
+        select(Booking)
+        .options(
+            selectinload(Booking.contact),
+            selectinload(Booking.booking_units).selectinload(BookingUnit.property)
+        )
+    )
+    if req.booking_id:
+        stmt = stmt.filter(Booking.id == req.booking_id)
+    else:
+        stmt = (
+            stmt.join(Contact)
+            .filter(Contact.phone == req.phone)
+            .order_by(text("CASE WHEN status = 'pending' THEN 0 ELSE 1 END"), Booking.created_at.desc())
+        )
+
+    res = await db.execute(stmt)
+    b = res.scalars().first()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    total = b.total_amount or Decimal("0.00")
+    deposit = req.deposit_amount
+    if deposit > total:
+        raise HTTPException(status_code=400, detail="deposit_amount cannot exceed total_amount")
+
+    b.deposit_amount = deposit
+    b.balance_due = total - deposit
+    if req.payment_due_date is not None:
+        b.payment_due_date = req.payment_due_date
+
+    now = datetime.now()
+    if b.status == "pending":
+        b.status = "confirmed"
+        if not b.confirmed_at:
+            b.confirmed_at = now
+
+    await db.commit()
+
+    stmt2 = (
+        select(Booking)
+        .options(
+            selectinload(Booking.contact),
+            selectinload(Booking.booking_units).selectinload(BookingUnit.property)
+        )
+        .filter(Booking.id == b.id)
+    )
+    res2 = await db.execute(stmt2)
+    updated = res2.scalar_one()
+    return _format_booking(updated)
