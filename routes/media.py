@@ -33,10 +33,10 @@ async def get_media_file(
     db: AsyncSession = Depends(get_db)
 ):
     if identifier.isdigit():
-        sql = text("SELECT mime_type, file_data, caption, media_id FROM whatsapp_media WHERE id = :id LIMIT 1")
-        params = {"id": int(identifier)}
+        sql = text("SELECT mime_type, file_data, caption, media_id FROM whatsapp_media WHERE id = :id OR media_id = :mid LIMIT 1")
+        params = {"id": int(identifier), "mid": identifier}
     else:
-        sql = text("SELECT mime_type, file_data, caption, media_id FROM whatsapp_media WHERE media_id = :mid ORDER BY created_at DESC LIMIT 1")
+        sql = text("SELECT mime_type, file_data, caption, media_id FROM whatsapp_media WHERE media_id = :mid OR id::text = :mid ORDER BY created_at DESC LIMIT 1")
         params = {"mid": identifier}
 
     result = await db.execute(sql, params)

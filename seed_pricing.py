@@ -27,6 +27,7 @@ async def seed_pricing_data():
             {"key": "default_pet_fee", "value": "30.00", "description": "Default pet fee per stay in USD"},
             {"key": "default_extra_person_fee", "value": "10.00", "description": "Default extra person fee per night in USD"},
             {"key": "multi_property_refundable_deposit", "value": "100.00", "description": "Multi-property refundable deposit in USD"},
+            {"key": "usd_to_crc_exchange_rate", "value": "452.94", "description": "Exchange rate: 1 USD to Costa Rican Colones (CRC)"},
         ]
         for s in default_settings:
             res = await session.execute(select(PricingSetting).filter(PricingSetting.key == s["key"]))

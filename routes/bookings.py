@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from database import get_db
-from models import Booking, BookingUnit, Contact, Property
+from models import Booking, BookingUnit, Contact, Property, PricingSetting
 
 router = APIRouter()
 
@@ -42,6 +42,7 @@ class BookingCreate(BaseModel):
     currency: Optional[str] = "USD"
     total_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     deposit_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
+    refundable_deposit: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     balance_due: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     deposit_due_date: Optional[date] = None
     payment_due_date: Optional[date] = None
@@ -63,6 +64,7 @@ class BookingUpdate(BaseModel):
     currency: Optional[str] = None
     total_amount: Optional[Decimal] = Field(None, ge=0)
     deposit_amount: Optional[Decimal] = Field(None, ge=0)
+    refundable_deposit: Optional[Decimal] = Field(None, ge=0)
     balance_due: Optional[Decimal] = Field(None, ge=0)
     deposit_due_date: Optional[date] = None
     payment_due_date: Optional[date] = None
@@ -77,6 +79,7 @@ class ConfirmDepositRequest(BaseModel):
     phone: Optional[str] = None
     booking_id: Optional[str] = None
     deposit_amount: Decimal = Field(..., ge=0)
+    currency: Optional[str] = "USD"
     payment_due_date: Optional[date] = None
 
 # Helper to format booking dictionary
@@ -126,6 +129,7 @@ def _format_booking(b: Booking) -> dict:
         "currency": b.currency or "USD",
         "total_amount": float(b.total_amount or 0),
         "deposit_amount": float(b.deposit_amount or 0),
+        "refundable_deposit": float(b.refundable_deposit or 0),
         "balance_due": float(b.balance_due or 0),
         "deposit_due_date": b.deposit_due_date.isoformat() if b.deposit_due_date else None,
         "payment_due_date": b.payment_due_date.isoformat() if b.payment_due_date else None,
@@ -173,7 +177,7 @@ async def list_bookings(
             )
         )
 
-    stmt = stmt.order_by(Booking.check_in.desc().nullslast(), Booking.created_at.desc())
+    stmt = stmt.order_by(Booking.created_at.desc(), Booking.check_in.desc().nullslast())
     res = await db.execute(stmt)
     bookings = res.scalars().all()
 
@@ -232,6 +236,7 @@ async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db))
         currency=req.currency,
         total_amount=req.total_amount,
         deposit_amount=req.deposit_amount,
+        refundable_deposit=req.refundable_deposit or Decimal("0.00"),
         balance_due=req.balance_due,
         deposit_due_date=req.deposit_due_date,
         payment_due_date=req.payment_due_date,
@@ -319,6 +324,10 @@ async def update_booking(booking_id: str, req: BookingUpdate, db: AsyncSession =
         b.has_pets = req.has_pets
     if req.guest_name is not None:
         b.guest_name = req.guest_name
+        if b.contact:
+            b.contact.name = req.guest_name
+        if not b.guest_first_name and req.guest_name:
+            b.guest_first_name = req.guest_name.split()[0]
     if req.guest_first_name is not None:
         b.guest_first_name = req.guest_first_name
     if req.language_tag is not None:
@@ -329,8 +338,12 @@ async def update_booking(booking_id: str, req: BookingUpdate, db: AsyncSession =
         b.total_amount = req.total_amount
     if req.deposit_amount is not None:
         b.deposit_amount = req.deposit_amount
+    if req.refundable_deposit is not None:
+        b.refundable_deposit = req.refundable_deposit
     if req.balance_due is not None:
         b.balance_due = req.balance_due
+    elif req.total_amount is not None or req.deposit_amount is not None:
+        b.balance_due = (b.total_amount or Decimal("0.00")) - (b.deposit_amount or Decimal("0.00"))
     if req.deposit_due_date is not None:
         b.deposit_due_date = req.deposit_due_date
     if req.payment_due_date is not None:
@@ -390,6 +403,25 @@ async def update_booking_status(booking_id: str, req: StatusTransitionRequest, d
     return {"status": "success", "new_status": b.status}
 
 
+@router.delete("/admin/bookings/{booking_id}")
+async def delete_booking(booking_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = (
+        select(Booking)
+        .options(selectinload(Booking.booking_units))
+        .filter(Booking.id == booking_id)
+    )
+    result = await db.execute(stmt)
+    b = result.scalar_one_or_none()
+    if not b:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    # Delete booking units first (cascade should handle this, but be explicit)
+    for unit in b.booking_units:
+        await db.delete(unit)
+    await db.delete(b)
+    await db.commit()
+    return {"status": "success", "message": "Booking deleted"}
+
 
 @router.post("/admin/bookings/confirm-deposit")
 async def confirm_deposit(req: ConfirmDepositRequest, db: AsyncSession = Depends(get_db)):
@@ -406,32 +438,81 @@ async def confirm_deposit(req: ConfirmDepositRequest, db: AsyncSession = Depends
     if req.booking_id:
         stmt = stmt.filter(Booking.id == req.booking_id)
     else:
+        raw_phone = (req.phone or "").strip()
+        clean_phone = raw_phone.lstrip("+")
+        phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}"} - {""})
         stmt = (
             stmt.join(Contact)
-            .filter(Contact.phone == req.phone)
+            .filter(Contact.phone.in_(phone_variants))
             .order_by(text("CASE WHEN status = 'pending' THEN 0 ELSE 1 END"), Booking.created_at.desc())
         )
 
     res = await db.execute(stmt)
     b = res.scalars().first()
     if not b:
-        raise HTTPException(status_code=404, detail="Booking not found")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No booking found for guest '{req.phone}'. Please create a booking for this guest first before confirming deposit."
+        )
+
+    curr_input = (req.currency or "USD").upper().strip()
+    deposit_in_usd = req.deposit_amount
+    rate_used = None
+
+    if curr_input in ("CRC", "COLONES", "₡"):
+        # Look up exchange rate from pricing_settings
+        rate_res = await db.execute(select(PricingSetting).filter(PricingSetting.key == "usd_to_crc_exchange_rate"))
+        rate_setting = rate_res.scalar_one_or_none()
+        try:
+            exchange_rate = Decimal(str(rate_setting.value)) if rate_setting and rate_setting.value else Decimal("452.94")
+        except Exception:
+            exchange_rate = Decimal("452.94")
+
+        if exchange_rate <= Decimal("0"):
+            exchange_rate = Decimal("452.94")
+
+        rate_used = exchange_rate
+        deposit_in_usd = round(req.deposit_amount / exchange_rate, 2)
 
     total = b.total_amount or Decimal("0.00")
-    deposit = req.deposit_amount
-    if deposit > total:
-        raise HTTPException(status_code=400, detail="deposit_amount cannot exceed total_amount")
+    if deposit_in_usd > total:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"deposit_amount ({req.deposit_amount} {curr_input} = ${deposit_in_usd:.2f} USD) cannot exceed total_amount (${total:.2f} USD)"
+        )
 
-    b.deposit_amount = deposit
-    b.balance_due = total - deposit
+    b.deposit_amount = deposit_in_usd
+    b.balance_due = total - deposit_in_usd
     if req.payment_due_date is not None:
         b.payment_due_date = req.payment_due_date
+
+    # Add conversion note to internal_notes if paid in Colones
+    if rate_used:
+        curr_notes = b.internal_notes or ""
+        conv_note = f"[Deposit received: ₡{int(req.deposit_amount):,} CRC = ${deposit_in_usd:.2f} USD @ rate 1 USD = {rate_used} CRC]"
+        if conv_note not in curr_notes:
+            b.internal_notes = f"{curr_notes}\n{conv_note}".strip()
 
     now = datetime.now()
     if b.status == "pending":
         b.status = "confirmed"
         if not b.confirmed_at:
             b.confirmed_at = now
+
+    # Sync guest names between Contact and Booking
+    contact = b.contact
+    booking_name = (b.guest_name or "").strip()
+    contact_name = (contact.name or "").strip()
+
+    if not contact_name or contact_name.lower() in ("unknown", "unknown guest"):
+        # Contact has no meaningful name — pull from booking
+        if booking_name:
+            contact.name = booking_name
+    elif contact_name:
+        # Contact already has a name — push to booking
+        b.guest_name = contact_name
+        if not b.guest_first_name:
+            b.guest_first_name = contact_name.split()[0]
 
     await db.commit()
 

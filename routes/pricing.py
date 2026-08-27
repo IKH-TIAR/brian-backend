@@ -98,6 +98,7 @@ class PricingSettingsUpdate(BaseModel):
     default_pet_fee: Optional[Decimal] = Field(None, ge=0)
     default_extra_person_fee: Optional[Decimal] = Field(None, ge=0)
     multi_property_refundable_deposit: Optional[Decimal] = Field(None, ge=0)
+    usd_to_crc_exchange_rate: Optional[Decimal] = Field(None, gt=0)
 
 # ==================================================
 # 1. PROPERTIES & RATE PLANS
@@ -152,13 +153,16 @@ async def update_property(property_id: str, req: PropertyUpdate, db: AsyncSessio
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found")
 
+    new_std = req.standard_capacity if req.standard_capacity is not None else prop.standard_capacity
+    new_max = req.maximum_capacity if req.maximum_capacity is not None else prop.maximum_capacity
+    if new_max < new_std:
+        raise HTTPException(status_code=400, detail="Maximum capacity cannot be less than standard capacity")
+
     if req.name is not None:
         prop.name = req.name
     if req.standard_capacity is not None:
         prop.standard_capacity = req.standard_capacity
     if req.maximum_capacity is not None:
-        if req.maximum_capacity < (req.standard_capacity or prop.standard_capacity):
-            raise HTTPException(status_code=400, detail="Maximum capacity cannot be less than standard capacity")
         prop.maximum_capacity = req.maximum_capacity
     if req.pets_allowed is not None:
         prop.pets_allowed = req.pets_allowed
@@ -177,13 +181,16 @@ async def update_rate_plan(plan_id: str, req: PropertyRatePlanUpdate, db: AsyncS
     if not plan:
         raise HTTPException(status_code=404, detail="Rate plan not found")
 
+    new_std = req.standard_capacity if req.standard_capacity is not None else plan.standard_capacity
+    new_max = req.maximum_capacity if req.maximum_capacity is not None else plan.maximum_capacity
+    if new_max < new_std:
+        raise HTTPException(status_code=400, detail="Maximum capacity cannot be less than standard capacity")
+
     if req.name is not None:
         plan.name = req.name
     if req.standard_capacity is not None:
         plan.standard_capacity = req.standard_capacity
     if req.maximum_capacity is not None:
-        if req.maximum_capacity < (req.standard_capacity or plan.standard_capacity):
-            raise HTTPException(status_code=400, detail="Maximum capacity cannot be less than standard capacity")
         plan.maximum_capacity = req.maximum_capacity
     if req.cleaning_fee is not None:
         plan.cleaning_fee = req.cleaning_fee
@@ -651,6 +658,7 @@ async def get_pricing_settings(db: AsyncSession = Depends(get_db)):
         "default_pet_fee": float(out_map.get("default_pet_fee", "30.00")) if "default_pet_fee" in out_map else 30.00,
         "default_extra_person_fee": float(out_map.get("default_extra_person_fee", "10.00")) if "default_extra_person_fee" in out_map else 10.00,
         "multi_property_refundable_deposit": float(out_map.get("multi_property_refundable_deposit", "100.00")) if "multi_property_refundable_deposit" in out_map else 100.00,
+        "usd_to_crc_exchange_rate": float(out_map.get("usd_to_crc_exchange_rate", "452.94")) if "usd_to_crc_exchange_rate" in out_map else 452.94,
     }
 
 @router.put("/admin/pricing/settings/{key}")
@@ -695,6 +703,8 @@ async def update_pricing_settings(req: PricingSettingsUpdate, db: AsyncSession =
         updates["default_extra_person_fee"] = str(req.default_extra_person_fee)
     if req.multi_property_refundable_deposit is not None:
         updates["multi_property_refundable_deposit"] = str(req.multi_property_refundable_deposit)
+    if req.usd_to_crc_exchange_rate is not None:
+        updates["usd_to_crc_exchange_rate"] = str(req.usd_to_crc_exchange_rate)
 
     for k, v in updates.items():
         res = await db.execute(select(PricingSetting).filter(PricingSetting.key == k))

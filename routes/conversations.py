@@ -1,3 +1,4 @@
+from datetime import datetime, date
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -6,8 +7,9 @@ from sqlalchemy import or_, desc, text
 import httpx
 import os
 
+import uuid
 from database import get_db, async_session_maker
-from models import Conversation, Contact, Message
+from models import Conversation, Contact, Message, Booking, Property, BookingUnit
 
 router = APIRouter()
 
@@ -47,7 +49,7 @@ async def list_conversations(
                 COALESCE(c.last_message_at, c.created_at) < :before_ts
                 OR (
                     COALESCE(c.last_message_at, c.created_at) = :before_ts
-                    AND c.id < :before_id
+                    AND c.id < :before_id::uuid
                 )
             )
         """
@@ -219,19 +221,31 @@ async def get_conversation_thread(
     newest_msg_ts = msgs_raw[0]["created_at"] if msgs_raw else None
     msgs_raw.reverse()  # back to chronological order for the frontend
 
-    # Query 3: Fetch media records for this phone number from whatsapp_media,
-    # bounded to the loaded message window (uses ix_wa_media_phone index)
-    media_params = {"phone": phone, "lim": 500}
-    media_window = ""
-    if newest_msg_ts:
-        media_window = "AND created_at <= :newest_ts"
-        media_params["newest_ts"] = newest_msg_ts
+    # Query 3: Fetch media records for this phone number from whatsapp_media
+    # (matches phone regardless of formatting or '+' prefix)
+    raw_phone = (phone or "").strip()
+    clean_digits = "".join(filter(str.isdigit, raw_phone))
+    clean_phone = raw_phone.lstrip("+")
+    plus_phone = f"+{clean_phone}"
+
+    media_params = {
+        "raw_phone": raw_phone,
+        "clean_phone": clean_phone,
+        "plus_phone": plus_phone,
+        "clean_digits": clean_digits,
+        "lim": 500
+    }
     media_result = await db.execute(
-        text(f"""
+        text("""
             SELECT id, media_id, mime_type, caption, file_size, created_at
             FROM whatsapp_media
-            WHERE phone = :phone
-            {media_window}
+            WHERE (
+                phone = :raw_phone 
+                OR phone = :clean_phone 
+                OR phone = :plus_phone 
+                OR phone = :clean_digits
+                OR regexp_replace(phone, '\\D', '', 'g') = :clean_digits
+            )
             ORDER BY created_at ASC
             LIMIT :lim
         """),
@@ -255,8 +269,15 @@ async def get_conversation_thread(
             "caption": None
         }
 
-        content_lower = (m["content"] or "").lower()
-        is_image_msg = ("image" in content_lower or "photo" in content_lower or "media" in content_lower or "picture" in content_lower)
+        content_raw = (m["content"] or "").strip()
+        content_lower = content_raw.lower()
+        is_image_msg = (
+            content_lower in ("image", "photo", "media", "picture", "[image]", "[photo]", "[media]", "[picture]", "[image received]", "[photo received]")
+            or content_lower.startswith("[image")
+            or content_lower.startswith("[photo")
+            or content_lower.startswith("[media")
+            or content_lower.startswith("image/")
+        )
 
         if is_image_msg and media_idx < len(media_rows):
             med = media_rows[media_idx]
@@ -277,6 +298,59 @@ async def get_conversation_thread(
     # Fire is_read update in the background — response is returned immediately
     background_tasks.add_task(_mark_messages_read, conv_id)
 
+    # Query 4: Fetch latest non-pending booking for this contact
+    booking_data = None
+    booking_result = await db.execute(
+        text("""
+            SELECT b.id, b.status, b.check_in, b.check_out, b.guest_count,
+                   b.has_pets, b.guest_name, b.total_amount, b.deposit_amount,
+                   b.refundable_deposit, b.balance_due, b.payment_due_date,
+                   b.deposit_due_date, b.currency
+            FROM bookings b
+            WHERE b.contact_id = (SELECT id FROM contacts WHERE phone = :phone)
+              AND b.status NOT IN ('pending')
+            ORDER BY b.created_at DESC
+            LIMIT 1
+        """),
+        {"phone": phone}
+    )
+    booking_row = booking_result.mappings().one_or_none()
+
+    if booking_row:
+        # Get property/bungalow names from booking_units
+        units_result = await db.execute(
+            text("""
+                SELECT bu.unit_name_snapshot, p.name AS property_name
+                FROM booking_units bu
+                LEFT JOIN properties p ON p.id = bu.property_id
+                WHERE bu.booking_id = :bid
+            """),
+            {"bid": str(booking_row["id"])}
+        )
+        units = units_result.mappings().all()
+        bungalow_names = [
+            u["unit_name_snapshot"] or u["property_name"] or "Unknown"
+            for u in units
+        ]
+
+        booking_data = {
+            "id": str(booking_row["id"]),
+            "status": booking_row["status"],
+            "check_in": booking_row["check_in"].isoformat() if booking_row["check_in"] else None,
+            "check_out": booking_row["check_out"].isoformat() if booking_row["check_out"] else None,
+            "guest_count": booking_row["guest_count"],
+            "has_pets": booking_row["has_pets"],
+            "guest_name": booking_row["guest_name"],
+            "total_amount": float(booking_row["total_amount"] or 0),
+            "deposit_amount": float(booking_row["deposit_amount"] or 0),
+            "refundable_deposit": float(booking_row["refundable_deposit"] or 0),
+            "balance_due": float(booking_row["balance_due"] or 0),
+            "payment_due_date": booking_row["payment_due_date"].isoformat() if booking_row["payment_due_date"] else None,
+            "deposit_due_date": booking_row["deposit_due_date"].isoformat() if booking_row["deposit_due_date"] else None,
+            "currency": booking_row["currency"] or "USD",
+            "bungalows": bungalow_names
+        }
+
     return {
         "contact": {
             "phone": result["phone"],
@@ -291,6 +365,7 @@ async def get_conversation_thread(
             "check_out": result["check_out"],
             "payment_due_date": result["payment_due_date"]
         },
+        "booking": booking_data,
         "messages": formatted_messages,
         "has_more": has_more
     }
@@ -312,6 +387,17 @@ async def update_contact(phone: str, update_data: ContactUpdate, db: AsyncSessio
         
     if update_data.name is not None:
         contact.name = update_data.name
+        # Sync name to all non-cancelled bookings for this contact
+        bookings_result = await db.execute(
+            select(Booking).filter(
+                Booking.contact_id == contact.id,
+                Booking.status.notin_(["cancelled"])
+            )
+        )
+        for booking in bookings_result.scalars().all():
+            booking.guest_name = update_data.name
+            if not booking.guest_first_name and update_data.name:
+                booking.guest_first_name = update_data.name.split()[0]
     if update_data.is_returning is not None:
         contact.is_returning = update_data.is_returning
         
@@ -345,6 +431,47 @@ async def update_booking(conversation_id: str, update_data: BookingUpdate, db: A
         
     if update_data.name is not None and conv.contact:
         conv.contact.name = update_data.name if update_data.name else None
+
+    # Also synchronize with the active booking if one exists
+    bk_stmt = (
+        select(Booking)
+        .filter(
+            or_(Booking.conversation_id == conv.id, Booking.contact_id == conv.contact_id),
+            Booking.status.notin_(["cancelled"])
+        )
+        .order_by(Booking.created_at.desc())
+        .limit(1)
+    )
+    bk_res = await db.execute(bk_stmt)
+    active_bk = bk_res.scalars().first()
+    if active_bk:
+        if update_data.check_in is not None:
+            active_bk.check_in = update_data.check_in
+        if update_data.check_out is not None:
+            active_bk.check_out = update_data.check_out
+        if update_data.name is not None:
+            active_bk.guest_name = update_data.name
+            if not active_bk.guest_first_name and update_data.name:
+                active_bk.guest_first_name = update_data.name.split()[0]
+        if update_data.bungalow:
+            # Match property by name or code and update booking unit
+            prop_query = update_data.bungalow.strip()
+            prop_stmt = select(Property).filter(
+                or_(
+                    Property.name.ilike(f"%{prop_query}%"),
+                    Property.code.ilike(f"%{prop_query}%")
+                )
+            ).limit(1)
+            prop_res = await db.execute(prop_stmt)
+            matched_prop = prop_res.scalar_one_or_none()
+            if matched_prop:
+                bu_stmt = select(BookingUnit).filter(BookingUnit.booking_id == active_bk.id).limit(1)
+                bu_res = await db.execute(bu_stmt)
+                bu = bu_res.scalar_one_or_none()
+                if bu:
+                    bu.property_id = matched_prop.id
+                else:
+                    db.add(BookingUnit(id=uuid.uuid4(), booking_id=active_bk.id, property_id=matched_prop.id))
         
     await db.commit()
     return {"status": "success"}
@@ -367,11 +494,9 @@ async def update_contact_mode(phone: str, update_data: ModeUpdate, db: AsyncSess
         
     contact.mode = update_data.mode
     contact.mode_reason = update_data.reason or ("Manual toggle via dashboard")
+    contact.mode_updated_at = datetime.now()
     
     await db.commit()
-    
-   
-    
     return {"status": "success", "new_mode": contact.mode}
 
 
@@ -387,6 +512,7 @@ async def resolve_escalation(phone: str, db: AsyncSession = Depends(get_db)):
         
     contact.mode = "BOT"
     contact.mode_reason = "Escalation resolved via dashboard"
+    contact.mode_updated_at = datetime.now()
     
     await db.commit()
     return {"status": "success"}

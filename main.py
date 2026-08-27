@@ -115,7 +115,9 @@ async def dispatch_web_push(payload_data: dict):
                     vapid_claims={"sub": subject}
                 )
             except WebPushException as ex:
-                if ex.response and ex.response.status_code in (404, 410):
+                err_str = str(ex).lower()
+                status_code = getattr(ex.response, 'status_code', None) if ex.response else None
+                if status_code in (404, 410) or "410" in err_str or "404" in err_str or "expired" in err_str or "unsubscribed" in err_str:
                     stale_ids.append(sub.id)
                 else:
                     print(f"Web Push send error: {ex}")
@@ -131,6 +133,16 @@ async def dispatch_web_push(payload_data: dict):
 
 async def poll_for_messages():
     last_message_id = None
+    try:
+        async for session in get_db():
+            res = await session.execute(select(Message.id).order_by(Message.created_at.desc()).limit(1))
+            row = res.first()
+            if row:
+                last_message_id = str(row.id)
+            break
+    except Exception as e:
+        print(f"Error initializing message poll baseline: {e}")
+
     while True:
         try:
             # Cheap poll: only id + conversation_id (uses ix_messages_created_at index)
@@ -142,42 +154,41 @@ async def poll_for_messages():
                 break
 
             if latest and str(latest.id) != last_message_id:
-                if last_message_id is not None:
-                    async for session in get_db():
-                        full_msg = (
-                            await session.execute(select(Message).filter(Message.id == latest.id))
-                        ).scalar_one_or_none()
-                        conv = (
-                            await session.execute(
-                                select(Conversation).options(selectinload(Conversation.contact)).filter_by(id=latest.conversation_id)
-                            )
-                        ).scalar_one_or_none()
-                        break
+                async for session in get_db():
+                    full_msg = (
+                        await session.execute(select(Message).filter(Message.id == latest.id))
+                    ).scalar_one_or_none()
+                    conv = (
+                        await session.execute(
+                            select(Conversation).options(selectinload(Conversation.contact)).filter_by(id=latest.conversation_id)
+                        )
+                    ).scalar_one_or_none()
+                    break
 
-                    if conv and conv.contact and full_msg:
-                        contact_name = conv.contact.name.strip() if (conv.contact.name and conv.contact.name.strip()) else None
-                        msg_data = {
-                            "id": str(full_msg.id),
-                            "conversation_id": str(full_msg.conversation_id),
-                            "phone": conv.contact.phone,
-                            "name": contact_name,
-                            "role": full_msg.role,
-                            "content": full_msg.content,
-                            "created_at": full_msg.created_at.isoformat() if full_msg.created_at else None,
-                            "escalated": full_msg.escalated,
-                            "escalation_reason": full_msg.escalation_reason,
-                            "contact_mode": conv.contact.mode
-                        }
-                        await manager.broadcast({
-                            "type": "new_message",
-                            "data": msg_data
-                        })
-                        asyncio.create_task(dispatch_web_push(msg_data))
+                if conv and conv.contact and full_msg:
+                    contact_name = conv.contact.name.strip() if (conv.contact.name and conv.contact.name.strip()) else None
+                    msg_data = {
+                        "id": str(full_msg.id),
+                        "conversation_id": str(full_msg.conversation_id),
+                        "phone": conv.contact.phone,
+                        "name": contact_name,
+                        "role": full_msg.role,
+                        "content": full_msg.content,
+                        "created_at": full_msg.created_at.isoformat() if full_msg.created_at else None,
+                        "escalated": full_msg.escalated,
+                        "escalation_reason": full_msg.escalation_reason,
+                        "contact_mode": conv.contact.mode
+                    }
+                    await manager.broadcast({
+                        "type": "new_message",
+                        "data": msg_data
+                    })
+                    asyncio.create_task(dispatch_web_push(msg_data))
                 last_message_id = str(latest.id)
         except Exception as e:
             print(f"Polling error: {e}")
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

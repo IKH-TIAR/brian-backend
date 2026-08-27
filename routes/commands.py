@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import case, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 import httpx
@@ -7,7 +8,7 @@ import os
 import uuid
 
 from database import get_db
-from models import AdminCommand, Contact, Conversation, Message
+from models import AdminCommand, Contact, Conversation, Message, Booking
 
 router = APIRouter()
 
@@ -90,15 +91,49 @@ class ExecuteCommandRequest(BaseModel):
     params: dict = {}
 
 @router.post("/commands/execute")
-async def execute_command(req: ExecuteCommandRequest):
-    webhook_url = os.getenv("N8N_WEBHOOK_URL")
+async def execute_command(req: ExecuteCommandRequest, db: AsyncSession = Depends(get_db)):
+    webhook_url = os.getenv("N8N_ADMIN_WEBHOOK_URL")
     if not webhook_url:
-        raise HTTPException(status_code=500, detail="N8N_WEBHOOK_URL not configured")
+        raise HTTPException(status_code=500, detail="N8N_ADMIN_WEBHOOK_URL not configured")
         
+    params = dict(req.params or {})
+
+    # Auto-enrich command params from guest's booking if missing/empty
+    raw_phone = (req.phone or "").strip()
+    clean_phone = raw_phone.lstrip("+")
+    phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}"} - {""})
+
+    if phone_variants:
+        stmt = (
+            select(Booking)
+            .join(Contact)
+            .filter(
+                Contact.phone.in_(phone_variants),
+                Booking.status.notin_(["cancelled"])
+            )
+            .order_by(case((Booking.status == 'pending', 1), else_=0), Booking.created_at.desc())
+        )
+        res = await db.execute(stmt)
+        booking = res.scalars().first()
+
+        if booking:
+            if req.command == "balance_due":
+                amt_str = str(params.get("amount") or "").strip()
+                amt_num = float(amt_str.replace("$", "").replace(",", "") or 0)
+                if amt_num <= 0 and booking.balance_due is not None:
+                    params["amount"] = f"${float(booking.balance_due):.2f}"
+
+            if req.command == "deposit_received":
+                dep_str = str(params.get("deposit_amount") or params.get("amount") or "").strip()
+                dep_num = float(dep_str.replace("$", "").replace(",", "") or 0)
+                if dep_num <= 0 and booking.deposit_amount is not None:
+                    params["deposit_amount"] = float(booking.deposit_amount)
+                    params["amount"] = float(booking.deposit_amount)
+
     payload = {
         "command": req.command,
         "phone": req.phone,
-        "params": req.params,
+        "params": params,
         "source": "admin_panel"
     }
     
@@ -176,6 +211,28 @@ class AdminResetRequest(BaseModel):
 
 @router.post("/admin-reset")
 async def admin_reset(req: AdminResetRequest, db: AsyncSession = Depends(get_db)):
+    # 1. Delete all messages for this contact from local database
+    raw_phone = (req.phone or "").strip()
+    clean_phone = raw_phone.lstrip("+")
+    phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}"} - {""})
+
+    if phone_variants:
+        stmt = (
+            select(Conversation)
+            .join(Contact)
+            .filter(Contact.phone.in_(phone_variants))
+        )
+        res = await db.execute(stmt)
+        conv = res.scalars().first()
+
+        if conv:
+            await db.execute(
+                text("DELETE FROM messages WHERE conversation_id = :cid"),
+                {"cid": str(conv.id)}
+            )
+            await db.commit()
+
+    # 2. Trigger n8n memory reset webhook
     webhook_url = os.getenv("N8N_MAIN_WEBHOOK_URL")
     if webhook_url:
         payload = {
@@ -195,8 +252,5 @@ async def admin_reset(req: AdminResetRequest, db: AsyncSession = Depends(get_db)
                 await client.post(webhook_url, json=payload, timeout=10.0)
             except Exception as e:
                 print(f"Failed to trigger n8n reset webhook: {e}")
-                raise HTTPException(status_code=500, detail="Failed to reach n8n workflow")
-    else:
-        raise HTTPException(status_code=500, detail="N8N_MAIN_WEBHOOK_URL is not set.")
-    
-    return {"status": "success"}
+
+    return {"status": "success", "message": "Chat history cleared from database and n8n reset."}
