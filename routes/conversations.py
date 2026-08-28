@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -253,8 +253,15 @@ async def get_conversation_thread(
     )
     media_rows = list(media_result.mappings().all())
 
+    def _to_timestamp(dt):
+        if dt is None:
+            return 0
+        if dt.tzinfo is not None:
+            return dt.timestamp()
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+
     formatted_messages = []
-    media_idx = 0
+    used_media_ids = set()
 
     for m in msgs_raw:
         msg_dict = {
@@ -279,19 +286,32 @@ async def get_conversation_thread(
             or content_lower.startswith("image/")
         )
 
-        if is_image_msg and media_idx < len(media_rows):
-            med = media_rows[media_idx]
-            msg_dict["media_url"] = f"/api/media/{med['id']}"
-            msg_dict["mime_type"] = med["mime_type"]
-            if med["caption"]:
-                msg_dict["caption"] = med["caption"]
-            media_idx += 1
-        elif is_image_msg and len(media_rows) > 0:
-            med = media_rows[-1]
-            msg_dict["media_url"] = f"/api/media/{med['id']}"
-            msg_dict["mime_type"] = med["mime_type"]
-            if med["caption"]:
-                msg_dict["caption"] = med["caption"]
+        if is_image_msg and media_rows:
+            # Find the best matching media record based on closest creation timestamp
+            msg_ts = _to_timestamp(m["created_at"])
+            best_med = None
+            min_diff = None
+            for med in media_rows:
+                if med["id"] in used_media_ids:
+                    continue
+                diff = abs(_to_timestamp(med["created_at"]) - msg_ts)
+                if min_diff is None or diff < min_diff:
+                    min_diff = diff
+                    best_med = med
+
+            if best_med:
+                used_media_ids.add(best_med["id"])
+                msg_dict["media_url"] = f"/api/media/{best_med['id']}"
+                msg_dict["mime_type"] = best_med["mime_type"]
+                if best_med["caption"]:
+                    msg_dict["caption"] = best_med["caption"]
+            else:
+                # Fallback to the latest media record if all have been claimed
+                med = media_rows[-1]
+                msg_dict["media_url"] = f"/api/media/{med['id']}"
+                msg_dict["mime_type"] = med["mime_type"]
+                if med["caption"]:
+                    msg_dict["caption"] = med["caption"]
 
         formatted_messages.append(msg_dict)
 
@@ -304,7 +324,7 @@ async def get_conversation_thread(
         text("""
             SELECT b.id, b.status, b.check_in, b.check_out, b.guest_count,
                    b.has_pets, b.guest_name, b.total_amount, b.deposit_amount,
-                   b.refundable_deposit, b.balance_due, b.payment_due_date,
+                   b.refundable_deposit, b.final_payment_amount, b.balance_due, b.payment_due_date,
                    b.deposit_due_date, b.currency
             FROM bookings b
             WHERE b.contact_id = (SELECT id FROM contacts WHERE phone = :phone)
@@ -344,6 +364,7 @@ async def get_conversation_thread(
             "total_amount": float(booking_row["total_amount"] or 0),
             "deposit_amount": float(booking_row["deposit_amount"] or 0),
             "refundable_deposit": float(booking_row["refundable_deposit"] or 0),
+            "final_payment_amount": float(booking_row["final_payment_amount"] or 0),
             "balance_due": float(booking_row["balance_due"] or 0),
             "payment_due_date": booking_row["payment_due_date"].isoformat() if booking_row["payment_due_date"] else None,
             "deposit_due_date": booking_row["deposit_due_date"].isoformat() if booking_row["deposit_due_date"] else None,
@@ -396,8 +417,9 @@ async def update_contact(phone: str, update_data: ContactUpdate, db: AsyncSessio
         )
         for booking in bookings_result.scalars().all():
             booking.guest_name = update_data.name
-            if not booking.guest_first_name and update_data.name:
-                booking.guest_first_name = update_data.name.split()[0]
+            if update_data.name:
+                parts = update_data.name.strip().split()
+                booking.guest_first_name = parts[0] if parts else ""
     if update_data.is_returning is not None:
         contact.is_returning = update_data.is_returning
         

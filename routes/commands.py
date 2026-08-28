@@ -3,12 +3,13 @@ from pydantic import BaseModel
 from sqlalchemy import case, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 import httpx
 import os
 import uuid
 
 from database import get_db
-from models import AdminCommand, Contact, Conversation, Message, Booking
+from models import AdminCommand, Contact, Conversation, Message, Booking, BookingUnit, Property
 
 router = APIRouter()
 
@@ -130,6 +131,35 @@ async def execute_command(req: ExecuteCommandRequest, db: AsyncSession = Depends
                     params["deposit_amount"] = float(booking.deposit_amount)
                     params["amount"] = float(booking.deposit_amount)
 
+            if req.command == "final_payment_received":
+                pay_str = str(params.get("payment_amount") or params.get("amount") or "").strip()
+                pay_num = float(pay_str.replace("$", "").replace(",", "") or 0)
+                if pay_num <= 0 and booking.balance_due is not None:
+                    params["payment_amount"] = float(booking.balance_due)
+                    params["amount"] = float(booking.balance_due)
+
+            if req.command == "pre_arrival_message":
+                # Auto-enrich bungalow from booking_units if left blank by admin
+                if not params.get("bungalow"):
+                    bu_stmt = (
+                        select(BookingUnit)
+                        .options(selectinload(BookingUnit.property))
+                        .filter(BookingUnit.booking_id == booking.id)
+                    )
+                    bu_res = await db.execute(bu_stmt)
+                    units = bu_res.scalars().all()
+                    if units:
+                        prop_names = [u.property.name for u in units if u.property]
+                        if prop_names:
+                            params["bungalow"] = ", ".join(prop_names)
+
+    # Validation: Pre-arrival message strictly requires either a booking or an explicit bungalow override
+    if req.command == "pre_arrival_message" and not params.get("bungalow"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No booking found for guest '{req.phone}' and no bungalow was specified. Please create a booking first or enter a bungalow in the override field."
+        )
+
     payload = {
         "command": req.command,
         "phone": req.phone,
@@ -141,9 +171,14 @@ async def execute_command(req: ExecuteCommandRequest, db: AsyncSession = Depends
         try:
             response = await client.post(webhook_url, json=payload, timeout=30.0)
             response.raise_for_status()
-            return response.json()
+            try:
+                return response.json()
+            except Exception:
+                return {"status": "success", "message": response.text or "Command executed successfully"}
         except httpx.HTTPError as e:
             raise HTTPException(status_code=500, detail=f"Failed to execute command: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Command execution error: {str(e)}")
 
 
 class AdminReplyRequest(BaseModel):
@@ -183,26 +218,29 @@ async def admin_reply(req: AdminReplyRequest, db: AsyncSession = Depends(get_db)
     # await db.commit()
     
     webhook_url = os.getenv("N8N_MAIN_WEBHOOK_URL")
-    if webhook_url:
-        payload = {
-            "source": "test_interface",
-            "messages": [
-                {
-                    "from": "50689494045", 
-                    "type": "text",
-                    "text": {
-                        "body": f"!reply {req.phone} {req.text}"
-                    }
+    if not webhook_url:
+        raise HTTPException(status_code=500, detail="N8N_MAIN_WEBHOOK_URL is not configured")
+
+    payload = {
+        "source": "test_interface",
+        "messages": [
+            {
+                "from": "50689494045", 
+                "type": "text",
+                "text": {
+                    "body": f"!reply {req.phone} {req.text}"
                 }
-            ]
-        }
-        async with httpx.AsyncClient() as client:
-            try:
-                await client.post(webhook_url, json=payload, timeout=10.0)
-            except Exception as e:
-                print(f"Failed to trigger n8n reply webhook: {e}")
-    else:
-        print("N8N_MAIN_WEBHOOK_URL is not set. Reply logged but not sent to n8n.")
+            }
+        ]
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(webhook_url, json=payload, timeout=20.0)
+            res.raise_for_status()
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to deliver admin reply to n8n: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error sending admin reply: {str(e)}")
     
     return {"status": "success", "message": "Admin reply logged and sent to n8n."}
 

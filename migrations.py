@@ -26,6 +26,7 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_psp_season_tier ON property_season_prices (season_id, pricing_tier_id)",
     "CREATE INDEX IF NOT EXISTS ix_admin_commands_cat_label ON admin_commands (category, label)",
     "CREATE INDEX IF NOT EXISTS ix_wa_media_phone ON whatsapp_media (phone, created_at)",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS final_payment_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00",
 ]
 
 

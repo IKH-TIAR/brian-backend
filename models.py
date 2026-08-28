@@ -300,6 +300,7 @@ class Booking(Base):
     total_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
     deposit_amount = Column(Numeric(10, 2), nullable=True, default=0.00)
     refundable_deposit = Column(Numeric(12, 2), nullable=False, default=0.00)
+    final_payment_amount = Column(Numeric(12, 2), nullable=False, default=0.00)
     balance_due = Column(Numeric(10, 2), nullable=True, default=0.00)
     deposit_due_date = Column(Date, nullable=True)
     payment_due_date = Column(Date, nullable=True)

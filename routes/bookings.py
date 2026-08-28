@@ -43,6 +43,7 @@ class BookingCreate(BaseModel):
     total_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     deposit_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     refundable_deposit: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
+    final_payment_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     balance_due: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     deposit_due_date: Optional[date] = None
     payment_due_date: Optional[date] = None
@@ -65,6 +66,7 @@ class BookingUpdate(BaseModel):
     total_amount: Optional[Decimal] = Field(None, ge=0)
     deposit_amount: Optional[Decimal] = Field(None, ge=0)
     refundable_deposit: Optional[Decimal] = Field(None, ge=0)
+    final_payment_amount: Optional[Decimal] = Field(None, ge=0)
     balance_due: Optional[Decimal] = Field(None, ge=0)
     deposit_due_date: Optional[date] = None
     payment_due_date: Optional[date] = None
@@ -130,6 +132,7 @@ def _format_booking(b: Booking) -> dict:
         "total_amount": float(b.total_amount or 0),
         "deposit_amount": float(b.deposit_amount or 0),
         "refundable_deposit": float(b.refundable_deposit or 0),
+        "final_payment_amount": float(b.final_payment_amount or 0),
         "balance_due": float(b.balance_due or 0),
         "deposit_due_date": b.deposit_due_date.isoformat() if b.deposit_due_date else None,
         "payment_due_date": b.payment_due_date.isoformat() if b.payment_due_date else None,
@@ -237,6 +240,7 @@ async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db))
         total_amount=req.total_amount,
         deposit_amount=req.deposit_amount,
         refundable_deposit=req.refundable_deposit or Decimal("0.00"),
+        final_payment_amount=req.final_payment_amount or Decimal("0.00"),
         balance_due=req.balance_due,
         deposit_due_date=req.deposit_due_date,
         payment_due_date=req.payment_due_date,
@@ -326,8 +330,9 @@ async def update_booking(booking_id: str, req: BookingUpdate, db: AsyncSession =
         b.guest_name = req.guest_name
         if b.contact:
             b.contact.name = req.guest_name
-        if not b.guest_first_name and req.guest_name:
-            b.guest_first_name = req.guest_name.split()[0]
+        if req.guest_first_name is None and req.guest_name:
+            parts = req.guest_name.strip().split()
+            b.guest_first_name = parts[0] if parts else ""
     if req.guest_first_name is not None:
         b.guest_first_name = req.guest_first_name
     if req.language_tag is not None:
@@ -340,10 +345,12 @@ async def update_booking(booking_id: str, req: BookingUpdate, db: AsyncSession =
         b.deposit_amount = req.deposit_amount
     if req.refundable_deposit is not None:
         b.refundable_deposit = req.refundable_deposit
+    if req.final_payment_amount is not None:
+        b.final_payment_amount = req.final_payment_amount
     if req.balance_due is not None:
         b.balance_due = req.balance_due
-    elif req.total_amount is not None or req.deposit_amount is not None:
-        b.balance_due = (b.total_amount or Decimal("0.00")) - (b.deposit_amount or Decimal("0.00"))
+    elif req.total_amount is not None or req.deposit_amount is not None or req.final_payment_amount is not None:
+        b.balance_due = max(Decimal("0.00"), (b.total_amount or Decimal("0.00")) - (b.deposit_amount or Decimal("0.00")) - (b.final_payment_amount or Decimal("0.00")))
     if req.deposit_due_date is not None:
         b.deposit_due_date = req.deposit_due_date
     if req.payment_due_date is not None:
@@ -513,6 +520,99 @@ async def confirm_deposit(req: ConfirmDepositRequest, db: AsyncSession = Depends
         b.guest_name = contact_name
         if not b.guest_first_name:
             b.guest_first_name = contact_name.split()[0]
+
+    await db.commit()
+
+    stmt2 = (
+        select(Booking)
+        .options(
+            selectinload(Booking.contact),
+            selectinload(Booking.booking_units).selectinload(BookingUnit.property)
+        )
+        .filter(Booking.id == b.id)
+    )
+    res2 = await db.execute(stmt2)
+    updated = res2.scalar_one()
+    return _format_booking(updated)
+
+
+class ConfirmFinalPaymentRequest(BaseModel):
+    phone: Optional[str] = None
+    booking_id: Optional[str] = None
+    payment_amount: Decimal = Field(..., ge=0)
+    currency: Optional[str] = "USD"
+
+@router.post("/admin/bookings/confirm-final-payment")
+async def confirm_final_payment(req: ConfirmFinalPaymentRequest, db: AsyncSession = Depends(get_db)):
+    if not req.booking_id and not req.phone:
+        raise HTTPException(status_code=400, detail="Provide either booking_id or phone")
+
+    stmt = (
+        select(Booking)
+        .options(
+            selectinload(Booking.contact),
+            selectinload(Booking.booking_units).selectinload(BookingUnit.property)
+        )
+    )
+    if req.booking_id:
+        stmt = stmt.filter(Booking.id == req.booking_id)
+    else:
+        raw_phone = (req.phone or "").strip()
+        clean_phone = raw_phone.lstrip("+")
+        phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}"} - {""})
+        stmt = (
+            stmt.join(Contact)
+            .filter(Contact.phone.in_(phone_variants))
+            .order_by(text("CASE WHEN status = 'pending' THEN 0 ELSE 1 END"), Booking.created_at.desc())
+        )
+
+    res = await db.execute(stmt)
+    b = res.scalars().first()
+    if not b:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No booking found for guest '{req.phone}'. Please create a booking first."
+        )
+
+    curr_input = (req.currency or "USD").upper().strip()
+    payment_in_usd = req.payment_amount
+    rate_used = None
+
+    if curr_input in ("CRC", "COLONES", "₡"):
+        rate_res = await db.execute(select(PricingSetting).filter(PricingSetting.key == "usd_to_crc_exchange_rate"))
+        rate_setting = rate_res.scalar_one_or_none()
+        try:
+            exchange_rate = Decimal(str(rate_setting.value)) if rate_setting and rate_setting.value else Decimal("452.94")
+        except Exception:
+            exchange_rate = Decimal("452.94")
+
+        if exchange_rate <= Decimal("0"):
+            exchange_rate = Decimal("452.94")
+
+        rate_used = exchange_rate
+        payment_in_usd = round(req.payment_amount / exchange_rate, 2)
+
+    current_balance = b.balance_due or Decimal("0.00")
+    if payment_in_usd > current_balance:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payment ({req.payment_amount} {curr_input} = ${payment_in_usd:.2f} USD) exceeds balance due (${current_balance:.2f} USD)"
+        )
+
+    b.final_payment_amount = (b.final_payment_amount or Decimal("0.00")) + payment_in_usd
+    b.balance_due = max(Decimal("0.00"), current_balance - payment_in_usd)
+
+    # Add conversion note to internal_notes if paid in Colones
+    if rate_used:
+        curr_notes = b.internal_notes or ""
+        conv_note = f"[Final payment received: ₡{int(req.payment_amount):,} CRC = ${payment_in_usd:.2f} USD @ rate 1 USD = {rate_used} CRC]"
+        if conv_note not in curr_notes:
+            b.internal_notes = f"{curr_notes}\n{conv_note}".strip()
+    else:
+        curr_notes = b.internal_notes or ""
+        conv_note = f"[Final payment received: ${payment_in_usd:.2f} USD]"
+        if conv_note not in curr_notes:
+            b.internal_notes = f"{curr_notes}\n{conv_note}".strip()
 
     await db.commit()
 
