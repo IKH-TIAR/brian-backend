@@ -426,6 +426,97 @@ async def update_contact(phone: str, update_data: ContactUpdate, db: AsyncSessio
     await db.commit()
     return {"status": "success"}
 
+@router.delete("/contacts/{phone}")
+async def delete_contact(phone: str, db: AsyncSession = Depends(get_db)):
+    raw_phone = (phone or "").strip()
+    clean_phone = raw_phone.lstrip("+")
+    clean_digits = "".join(filter(str.isdigit, raw_phone))
+    phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}", clean_digits} - {""})
+
+    # 1. Find the contact
+    stmt = select(Contact).filter(Contact.phone.in_(phone_variants))
+    res = await db.execute(stmt)
+    contact = res.scalars().first()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    contact_id = contact.id
+
+    # 2. Delete all Booking Units and Bookings
+    bk_stmt = select(Booking).options(selectinload(Booking.booking_units)).filter(Booking.contact_id == contact_id)
+    bk_res = await db.execute(bk_stmt)
+    bookings = bk_res.scalars().all()
+    for b in bookings:
+        if b.booking_units:
+            for u in b.booking_units:
+                await db.delete(u)
+        await db.delete(b)
+    await db.flush()
+
+    # 3. Find and delete all Messages and Conversations
+    conv_stmt = select(Conversation).filter(Conversation.contact_id == contact_id)
+    conv_res = await db.execute(conv_stmt)
+    conversations = conv_res.scalars().all()
+    for conv in conversations:
+        await db.execute(
+            text("DELETE FROM messages WHERE conversation_id = :cid"),
+            {"cid": str(conv.id)}
+        )
+        await db.delete(conv)
+    await db.flush()
+
+    # 4. Clean up media and template send records associated with this phone
+    try:
+        await db.execute(
+            text("""
+                DELETE FROM whatsapp_media 
+                WHERE phone = :p1 OR phone = :p2 OR phone = :p3 OR phone = :p4 
+                   OR regexp_replace(phone, '\\D', '', 'g') = :p4
+            """),
+            {"p1": raw_phone, "p2": clean_phone, "p3": f"+{clean_phone}", "p4": clean_digits}
+        )
+    except Exception as e:
+        print(f"whatsapp_media delete skipped: {e}")
+
+    try:
+        await db.execute(
+            text("""
+                DELETE FROM whatsapp_template_sends 
+                WHERE phone = :p1 OR phone = :p2 OR phone = :p3 OR phone = :p4
+                   OR regexp_replace(phone, '\\D', '', 'g') = :p4
+            """),
+            {"p1": raw_phone, "p2": clean_phone, "p3": f"+{clean_phone}", "p4": clean_digits}
+        )
+    except Exception as e:
+        print(f"whatsapp_template_sends delete skipped: {e}")
+
+    # 5. Delete the Contact record
+    await db.delete(contact)
+    await db.commit()
+
+    # 6. Trigger n8n memory reset asynchronously in the background
+    webhook_url = os.getenv("N8N_MAIN_WEBHOOK_URL")
+    if webhook_url:
+        payload = {
+            "source": "test_interface",
+            "messages": [
+                {
+                    "from": "50689494045", 
+                    "type": "text",
+                    "text": {
+                        "body": f"!reset {phone}"
+                    }
+                }
+            ]
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(webhook_url, json=payload, timeout=5.0)
+        except Exception as e:
+            print(f"n8n reset trigger on contact delete skipped: {e}")
+
+    return {"status": "success", "message": f"Contact '{phone}' and all related data deleted successfully"}
+
 from datetime import date
 from typing import Optional
 
