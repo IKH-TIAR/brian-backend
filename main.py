@@ -167,6 +167,26 @@ async def poll_for_messages():
 
                 if conv and conv.contact and full_msg:
                     contact_name = conv.contact.name.strip() if (conv.contact.name and conv.contact.name.strip()) else None
+                    media_url = None
+                    caption = None
+                    c_lower = (full_msg.content or "").lower()
+                    if "[image" in c_lower or "[photo" in c_lower or "[media" in c_lower:
+                        async for session in get_db():
+                            clean_p = "".join(filter(str.isdigit, conv.contact.phone or ""))
+                            med_res = await session.execute(
+                                text("""
+                                    SELECT id, caption FROM whatsapp_media
+                                    WHERE phone = :p OR regexp_replace(phone, '\\D', '', 'g') = :clean
+                                    ORDER BY created_at DESC LIMIT 1
+                                """),
+                                {"p": conv.contact.phone, "clean": clean_p}
+                            )
+                            med_row = med_res.mappings().first()
+                            if med_row:
+                                media_url = f"/api/media/{med_row['id']}"
+                                caption = med_row["caption"]
+                            break
+
                     msg_data = {
                         "id": str(full_msg.id),
                         "conversation_id": str(full_msg.conversation_id),
@@ -177,7 +197,9 @@ async def poll_for_messages():
                         "created_at": full_msg.created_at.isoformat() if full_msg.created_at else None,
                         "escalated": full_msg.escalated,
                         "escalation_reason": full_msg.escalation_reason,
-                        "contact_mode": conv.contact.mode
+                        "contact_mode": conv.contact.mode,
+                        "media_url": media_url,
+                        "caption": caption
                     }
                     await manager.broadcast({
                         "type": "new_message",

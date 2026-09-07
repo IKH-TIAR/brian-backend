@@ -279,11 +279,11 @@ async def get_conversation_thread(
         content_raw = (m["content"] or "").strip()
         content_lower = content_raw.lower()
         is_image_msg = (
-            content_lower in ("image", "photo", "media", "picture", "[image]", "[photo]", "[media]", "[picture]", "[image received]", "[photo received]")
-            or content_lower.startswith("[image")
-            or content_lower.startswith("[photo")
-            or content_lower.startswith("[media")
-            or content_lower.startswith("image/")
+            "[image" in content_lower
+            or "[photo" in content_lower
+            or "[media" in content_lower
+            or "image/" in content_lower
+            or content_lower in ("image", "photo", "media", "picture")
         )
 
         if is_image_msg and media_rows:
@@ -299,19 +299,27 @@ async def get_conversation_thread(
                     min_diff = diff
                     best_med = med
 
+            # Extract human caption if present in content_raw (e.g. "what is this? [IMAGE RECEIVED]")
+            detected_caption = None
+            if "[image" in content_lower:
+                clean_text = content_raw
+                for tag in ["[image received]", "[IMAGE RECEIVED]", "[image]", "[IMAGE]", "[photo received]", "[PHOTO RECEIVED]"]:
+                    clean_text = clean_text.replace(tag, "")
+                clean_text = clean_text.strip()
+                if clean_text:
+                    detected_caption = clean_text
+
             if best_med:
                 used_media_ids.add(best_med["id"])
                 msg_dict["media_url"] = f"/api/media/{best_med['id']}"
                 msg_dict["mime_type"] = best_med["mime_type"]
-                if best_med["caption"]:
-                    msg_dict["caption"] = best_med["caption"]
+                msg_dict["caption"] = best_med["caption"] or detected_caption
             else:
                 # Fallback to the latest media record if all have been claimed
                 med = media_rows[-1]
                 msg_dict["media_url"] = f"/api/media/{med['id']}"
                 msg_dict["mime_type"] = med["mime_type"]
-                if med["caption"]:
-                    msg_dict["caption"] = med["caption"]
+                msg_dict["caption"] = med["caption"] or detected_caption
 
         formatted_messages.append(msg_dict)
 
