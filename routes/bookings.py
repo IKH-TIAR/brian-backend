@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from database import get_db
-from models import Booking, BookingUnit, Contact, Property, PricingSetting
+from models import Booking, BookingUnit, Contact, Conversation, Property, PricingSetting
 
 router = APIRouter()
 
@@ -27,9 +27,10 @@ class BookingUnitCreate(BaseModel):
 
 class BookingCreate(BaseModel):
     reservation_reference: Optional[str] = None
-    contact_id: str
+    contact_id: Optional[str] = None
+    phone: Optional[str] = None
     conversation_id: Optional[str] = None
-    source: Optional[str] = None
+    source: Optional[str] = "direct"
     status: str = "pending"
     check_in: Optional[date] = None
     check_out: Optional[date] = None
@@ -44,7 +45,7 @@ class BookingCreate(BaseModel):
     deposit_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     refundable_deposit: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
     final_payment_amount: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
-    balance_due: Optional[Decimal] = Field(Decimal("0.00"), ge=0)
+    balance_due: Optional[Decimal] = Field(None, ge=0)
     deposit_due_date: Optional[date] = None
     payment_due_date: Optional[date] = None
     pricing_snapshot: Optional[dict] = None
@@ -91,44 +92,39 @@ def _format_booking(b: Booking) -> dict:
         for u in b.booking_units:
             units_out.append({
                 "id": str(u.id),
-                "property_id": str(u.property_id) if u.property_id else None,
+                "property_id": str(u.property_id),
                 "property_name": u.property.name if u.property else None,
-                "unit_name_snapshot": u.unit_name_snapshot or (u.property.name if u.property else ""),
+                "unit_name_snapshot": u.unit_name_snapshot,
                 "accommodation_amount": float(u.accommodation_amount or 0),
                 "cleaning_fee": float(u.cleaning_fee or 0),
                 "pet_fee": float(u.pet_fee or 0),
                 "discount_amount": float(u.discount_amount or 0),
                 "unit_total": float(u.unit_total or 0),
-                "pricing_snapshot": u.pricing_snapshot
+                "pricing_snapshot": u.pricing_snapshot or {}
             })
-
-    contact_data = None
-    if b.contact:
-        contact_data = {
-            "id": str(b.contact.id),
-            "phone": b.contact.phone,
-            "name": b.contact.name,
-            "is_returning": b.contact.is_returning,
-            "mode": b.contact.mode
-        }
 
     return {
         "id": str(b.id),
-        "reservation_reference": b.reservation_reference or "",
+        "reservation_reference": b.reservation_reference,
         "contact_id": str(b.contact_id),
         "conversation_id": str(b.conversation_id) if b.conversation_id else None,
-        "contact": contact_data,
-        "source": b.source or "",
+        "contact": {
+            "id": str(b.contact.id),
+            "phone": b.contact.phone,
+            "name": b.contact.name,
+            "mode": b.contact.mode
+        } if b.contact else None,
+        "source": b.source,
         "status": b.status,
         "check_in": b.check_in.isoformat() if b.check_in else None,
         "check_out": b.check_out.isoformat() if b.check_out else None,
         "checkout_time": str(b.checkout_time) if b.checkout_time else "11:00:00",
-        "guest_count": b.guest_count or 1,
+        "guest_count": b.guest_count,
         "has_pets": b.has_pets,
-        "guest_name": b.guest_name or "",
-        "guest_first_name": b.guest_first_name or "",
-        "language_tag": b.language_tag or "english",
-        "currency": b.currency or "USD",
+        "guest_name": b.guest_name,
+        "guest_first_name": b.guest_first_name,
+        "language_tag": b.language_tag,
+        "currency": b.currency,
         "total_amount": float(b.total_amount or 0),
         "deposit_amount": float(b.deposit_amount or 0),
         "refundable_deposit": float(b.refundable_deposit or 0),
@@ -136,24 +132,29 @@ def _format_booking(b: Booking) -> dict:
         "balance_due": float(b.balance_due or 0),
         "deposit_due_date": b.deposit_due_date.isoformat() if b.deposit_due_date else None,
         "payment_due_date": b.payment_due_date.isoformat() if b.payment_due_date else None,
-        "pricing_snapshot": b.pricing_snapshot,
-        "internal_notes": b.internal_notes or "",
+        "pricing_snapshot": b.pricing_snapshot or {},
+        "internal_notes": b.internal_notes,
         "confirmed_at": b.confirmed_at.isoformat() if b.confirmed_at else None,
         "checked_in_at": b.checked_in_at.isoformat() if b.checked_in_at else None,
         "completed_at": b.completed_at.isoformat() if b.completed_at else None,
         "cancelled_at": b.cancelled_at.isoformat() if b.cancelled_at else None,
         "created_at": b.created_at.isoformat() if b.created_at else None,
+        "updated_at": b.updated_at.isoformat() if b.updated_at else None,
         "units": units_out
     }
 
-# --- Routes ---
+# ==================================================
+# ENDPOINTS
+# ==================================================
 
 @router.get("/admin/bookings")
 async def list_bookings(
-    status_filter: Optional[str] = Query(None, alias="status"),
-    check_in_from: Optional[date] = Query(None),
-    check_in_to: Optional[date] = Query(None),
-    search: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="Filter by booking status"),
+    search: Optional[str] = Query(None, description="Search guest name, ref, or phone"),
+    check_in_from: Optional[date] = Query(None, description="Check-in on or after date"),
+    check_in_to: Optional[date] = Query(None, description="Check-in on or before date"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db)
 ):
     stmt = (
@@ -162,27 +163,33 @@ async def list_bookings(
             selectinload(Booking.contact),
             selectinload(Booking.booking_units).selectinload(BookingUnit.property)
         )
+        .order_by(Booking.created_at.desc())
     )
 
-    if status_filter:
-        stmt = stmt.filter(Booking.status == status_filter)
+    if status:
+        stmt = stmt.filter(Booking.status == status)
+
     if check_in_from:
         stmt = stmt.filter(Booking.check_in >= check_in_from)
+
     if check_in_to:
         stmt = stmt.filter(Booking.check_in <= check_in_to)
+
     if search:
-        stmt = stmt.join(Contact).filter(
+        search_pattern = f"%{search.strip()}%"
+        stmt = stmt.outerjoin(Contact, Booking.contact_id == Contact.id).filter(
             or_(
-                Booking.reservation_reference.ilike(f"%{search}%"),
-                Booking.guest_name.ilike(f"%{search}%"),
-                Contact.phone.ilike(f"%{search}%"),
-                Contact.name.ilike(f"%{search}%")
+                Booking.reservation_reference.ilike(search_pattern),
+                Booking.guest_name.ilike(search_pattern),
+                Booking.guest_first_name.ilike(search_pattern),
+                Contact.name.ilike(search_pattern),
+                Contact.phone.ilike(search_pattern)
             )
         )
 
-    stmt = stmt.order_by(Booking.created_at.desc(), Booking.check_in.desc().nullslast())
-    res = await db.execute(stmt)
-    bookings = res.scalars().all()
+    stmt = stmt.limit(limit).offset(offset)
+    result = await db.execute(stmt)
+    bookings = result.scalars().all()
 
     return [_format_booking(b) for b in bookings]
 
@@ -207,10 +214,44 @@ async def get_booking(booking_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/admin/bookings")
 async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db)):
-    contact_res = await db.execute(select(Contact).filter(Contact.id == req.contact_id))
-    contact = contact_res.scalar_one_or_none()
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
+    contact = None
+    if req.contact_id:
+        contact_res = await db.execute(select(Contact).filter(Contact.id == req.contact_id))
+        contact = contact_res.scalar_one_or_none()
+        if not contact:
+            raise HTTPException(status_code=404, detail="Contact not found")
+    elif req.phone:
+        raw_phone = req.phone.strip()
+        clean_phone = raw_phone.lstrip("+")
+        clean_digits = "".join(filter(str.isdigit, raw_phone))
+        phone_variants = list({raw_phone, clean_phone, f"+{clean_phone}", clean_digits} - {""})
+        
+        contact_res = await db.execute(select(Contact).filter(Contact.phone.in_(phone_variants)))
+        contact = contact_res.scalars().first()
+        if not contact:
+            raise HTTPException(
+                status_code=404,
+                detail="Contact not found. Bookings can only be created for existing contacts."
+            )
+        elif req.guest_name and (not contact.name or contact.name.lower() in ("unknown", "unknown guest")):
+            contact.name = req.guest_name
+    else:
+        raise HTTPException(status_code=400, detail="Either contact_id or phone must be provided")
+
+    # Find or create Conversation if conversation_id not explicitly given
+    conv_id = req.conversation_id
+    if not conv_id:
+        conv_stmt = select(Conversation).filter(Conversation.contact_id == contact.id).limit(1)
+        conv_res = await db.execute(conv_stmt)
+        conv = conv_res.scalar_one_or_none()
+        if not conv:
+            conv = Conversation(
+                id=uuid.uuid4(),
+                contact_id=contact.id
+            )
+            db.add(conv)
+            await db.flush()
+        conv_id = str(conv.id)
 
     # Parse checkout_time string to time object if needed
     co_time = None
@@ -220,28 +261,43 @@ async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db))
             co_time = time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0)
         except Exception:
             co_time = time(11, 0, 0)
+    else:
+        co_time = time(11, 0, 0)
+
+    # Auto extract guest_first_name if missing
+    g_first_name = req.guest_first_name
+    if not g_first_name and (req.guest_name or contact.name):
+        full_nm = (req.guest_name or contact.name or "").strip()
+        parts = full_nm.split()
+        g_first_name = parts[0] if parts else ""
+
+    # Calculate balance_due if not provided
+    tot = req.total_amount or Decimal("0.00")
+    dep = req.deposit_amount or Decimal("0.00")
+    fin = req.final_payment_amount or Decimal("0.00")
+    bal = req.balance_due if req.balance_due is not None else max(Decimal("0.00"), tot - dep - fin)
 
     booking = Booking(
         id=uuid.uuid4(),
         reservation_reference=req.reservation_reference,
-        contact_id=req.contact_id,
-        conversation_id=req.conversation_id,
-        source=req.source,
-        status=req.status,
+        contact_id=contact.id,
+        conversation_id=uuid.UUID(conv_id) if isinstance(conv_id, str) else conv_id,
+        source=req.source or "direct",
+        status=req.status or "pending",
         check_in=req.check_in,
         check_out=req.check_out,
         checkout_time=co_time,
-        guest_count=req.guest_count,
-        has_pets=req.has_pets,
+        guest_count=req.guest_count or 1,
+        has_pets=req.has_pets or False,
         guest_name=req.guest_name or contact.name,
-        guest_first_name=req.guest_first_name,
-        language_tag=req.language_tag,
-        currency=req.currency,
-        total_amount=req.total_amount,
-        deposit_amount=req.deposit_amount,
+        guest_first_name=g_first_name,
+        language_tag=req.language_tag or "english",
+        currency=req.currency or "USD",
+        total_amount=tot,
+        deposit_amount=dep,
         refundable_deposit=req.refundable_deposit or Decimal("0.00"),
-        final_payment_amount=req.final_payment_amount or Decimal("0.00"),
-        balance_due=req.balance_due,
+        final_payment_amount=fin,
+        balance_due=bal,
         deposit_due_date=req.deposit_due_date,
         payment_due_date=req.payment_due_date,
         pricing_snapshot=req.pricing_snapshot,
@@ -262,24 +318,38 @@ async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db))
     await db.flush()
 
     for u_req in req.units:
+        # If unit_name_snapshot is not provided, try to lookup Property name
+        u_name = u_req.unit_name_snapshot
+        if not u_name and u_req.property_id:
+            p_res = await db.execute(select(Property).filter(Property.id == u_req.property_id))
+            prop = p_res.scalar_one_or_none()
+            if prop:
+                u_name = prop.name
+
+        prop_uuid = None
+        if u_req.property_id:
+            try:
+                prop_uuid = uuid.UUID(u_req.property_id) if isinstance(u_req.property_id, str) else u_req.property_id
+            except Exception:
+                prop_uuid = None
+
         unit = BookingUnit(
             id=uuid.uuid4(),
             booking_id=booking.id,
-            property_id=u_req.property_id,
-            unit_name_snapshot=u_req.unit_name_snapshot,
-            accommodation_amount=u_req.accommodation_amount,
-            cleaning_fee=u_req.cleaning_fee,
-            pet_fee=u_req.pet_fee,
-            discount_amount=u_req.discount_amount,
-            unit_total=u_req.unit_total,
+            property_id=prop_uuid,
+            unit_name_snapshot=u_name or "Unit",
+            accommodation_amount=u_req.accommodation_amount or Decimal("0.00"),
+            cleaning_fee=u_req.cleaning_fee or Decimal("0.00"),
+            pet_fee=u_req.pet_fee or Decimal("0.00"),
+            discount_amount=u_req.discount_amount or Decimal("0.00"),
+            unit_total=u_req.unit_total or Decimal("0.00"),
             pricing_snapshot=u_req.pricing_snapshot
         )
         db.add(unit)
 
     await db.commit()
 
-    # Re-fetch for return
-    stmt = (
+    stmt2 = (
         select(Booking)
         .options(
             selectinload(Booking.contact),
@@ -287,8 +357,8 @@ async def create_booking(req: BookingCreate, db: AsyncSession = Depends(get_db))
         )
         .filter(Booking.id == booking.id)
     )
-    res = await db.execute(stmt)
-    created_booking = res.scalar_one()
+    res2 = await db.execute(stmt2)
+    created_booking = res2.scalar_one()
 
     return _format_booking(created_booking)
 

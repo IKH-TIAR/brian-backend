@@ -138,26 +138,22 @@ async def execute_command(req: ExecuteCommandRequest, db: AsyncSession = Depends
                     params["payment_amount"] = float(booking.balance_due)
                     params["amount"] = float(booking.balance_due)
 
-            if req.command == "pre_arrival_message":
-                # Auto-enrich bungalow from booking_units if left blank by admin
-                if not params.get("bungalow"):
-                    bu_stmt = (
-                        select(BookingUnit)
-                        .options(selectinload(BookingUnit.property))
-                        .filter(BookingUnit.booking_id == booking.id)
-                    )
-                    bu_res = await db.execute(bu_stmt)
-                    units = bu_res.scalars().all()
-                    if units:
-                        prop_names = [u.property.name for u in units if u.property]
-                        if prop_names:
-                            params["bungalow"] = ", ".join(prop_names)
+            if req.command in ("pre_arrival_message", "pre_arrival", "pre_checkout", "post_checkout_thankyou"):
+                key_map = {
+                    "pre_arrival_message": "pre_arrival",
+                    "pre_arrival": "pre_arrival",
+                    "pre_checkout": "pre_checkout",
+                    "post_checkout_thankyou": "post_checkout_thankyou"
+                }
+                template_key = key_map[req.command]
+                from routes.template_send_webhook import dispatch_booking_template
+                return await dispatch_booking_template(db, str(booking.id), template_key)
 
-    # Validation: Pre-arrival message strictly requires either a booking or an explicit bungalow override
-    if req.command == "pre_arrival_message" and not params.get("bungalow"):
+    # Validation: Template messages strictly require an active booking
+    if req.command in ("pre_arrival_message", "pre_arrival", "pre_checkout", "post_checkout_thankyou"):
         raise HTTPException(
             status_code=404,
-            detail=f"No booking found for guest '{req.phone}' and no bungalow was specified. Please create a booking first or enter a bungalow in the override field."
+            detail=f"No active booking found for guest '{req.phone}'. An active booking is required to send this WhatsApp template."
         )
 
     payload = {
